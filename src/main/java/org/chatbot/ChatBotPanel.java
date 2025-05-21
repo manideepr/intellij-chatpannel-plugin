@@ -35,12 +35,9 @@ public class ChatBotPanel extends JPanel {
         if (question.isEmpty()) return;
         inputField.setText("");
         appendMessage("You: " + escapeHtml(question), false);
-
-        // Simulate an async backend call (for testing, replace this with ChatBotAPI.ask)
         new SwingWorker<String, Void>() {
             @Override
             protected String doInBackground() {
-
                 //return "Here is a code sample:\n```java\npublic class Hello { public static void main(String[] args) { System.out.println(\"Hi\"); } }\n```";
                  return ChatBotAPI.ask(question); // <-- use this in real version
             }
@@ -72,9 +69,7 @@ public class ChatBotPanel extends JPanel {
 
     private String markdownToHtml(String markdown) {
         markdown = markdown.replace("\\n", "\n");
-
         String safe = escapeHtml(markdown);
-
         safe = safe.replaceAll(
                 "```java([\\s\\S]*?)```",
                 "<pre style='background:#f5f5f5;border:1px solid #ddd;padding:8px;white-space:pre-wrap;word-break:break-all;'><code style='color:black;'>$1</code></pre>"
@@ -85,9 +80,7 @@ public class ChatBotPanel extends JPanel {
         );
         // Inline code
         safe = safe.replaceAll("`([^`]+)`", "<code style='color:black;'>$1</code>");
-
         safe = safe.replaceAll("\n", "<br>");
-
         return safe;
     }
 
