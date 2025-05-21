@@ -71,7 +71,10 @@ public class ChatBotPanel extends JPanel {
     }
 
     private String markdownToHtml(String markdown) {
+        markdown = markdown.replace("\\n", "\n");
+
         String safe = escapeHtml(markdown);
+
         safe = safe.replaceAll(
                 "```java([\\s\\S]*?)```",
                 "<pre style='background:#f5f5f5;border:1px solid #ddd;padding:8px;white-space:pre-wrap;word-break:break-all;'><code style='color:black;'>$1</code></pre>"
@@ -80,9 +83,14 @@ public class ChatBotPanel extends JPanel {
                 "```([\\s\\S]*?)```",
                 "<pre style='background:#f5f5f5;border:1px solid #ddd;padding:8px;white-space:pre-wrap;word-break:break-all;'><code style='color:black;'>$1</code></pre>"
         );
-        safe = safe.replaceAll("`([^`]+)`", "<code>$1</code>");
-        return safe.replace("\n", "<br>");
+        // Inline code
+        safe = safe.replaceAll("`([^`]+)`", "<code style='color:black;'>$1</code>");
+
+        safe = safe.replaceAll("\n", "<br>");
+
+        return safe;
     }
+
 
 
     private String escapeHtml(String text) {
