@@ -1,0 +1,17 @@
+<idea-plugin>
+    <id>org.chatbot.intellijchatbot</id>
+    <name>RAG Chatbot</name>
+    <vendor>Example</vendor>
+    <description>
+        Chat with your Java codebase using RAG + web context.
+    </description>
+    <depends>com.intellij.modules.platform</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+    <toolWindow id="JavaRAGChatBot"
+                factoryClass="org.chatbot.ChatBotToolWindowFactory"
+                anchor="right"
+                secondary="false"/>
+    </extensions>
+
+</idea-plugin>

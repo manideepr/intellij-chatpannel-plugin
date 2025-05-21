@@ -1,0 +1,31 @@
+# Gradle build files
+.gradle/
+build/
+
+# Gradle wrapper
+gradle/wrapper/gradle-wrapper.jar
+gradle/wrapper/dists
+
+# IDE files
+.idea/
+*.iml
+
+# Java class files
+*.class
+
+# Jar files
+*.jar
+
+# Log files
+*.log
+
+# Operating System files
+.DS_Store
+Thumbs.db
+
+# Executable files
+*.exe
+
+# Temporary files
+*~
+\#*
