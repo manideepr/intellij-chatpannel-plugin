@@ -1,110 +1,12 @@
 package com.manideepr.chat;
 
-import com.intellij.openapi.application.ApplicationManager;
-import com.intellij.openapi.components.Service;
-import com.intellij.openapi.project.Project;
-import org.chatbot.ChatBotAPI;
-import org.jetbrains.annotations.Nullable;
-
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.List;
-
-@Service(Service.Level.PROJECT)
-public final class ChatService {
-
-  public interface Sink {
-    void onUser(String text);
-    void onAssistant(String text);
-    void onError(String message);
-    default void onReset() {}
-  }
-
-  private enum Role { USER, ASSISTANT, ERROR }
-
-  private static final class Msg {
-    final Role role; final String text;
-    Msg(Role role, String text) { this.role = role; this.text = text; }
-  }
-
-  // Thread-safe transcript store
-  private final List<Msg> transcript = Collections.synchronizedList(new ArrayList<>());
-
-  private volatile @Nullable Sink sink;
-
-  public static ChatService getInstance(Project project) {
-    return project.getService(ChatService.class);
-  }
-
-  /** UI registers to receive updates. We immediately replay the transcript. */
-  public void setSink(@Nullable Sink sink) {
-    this.sink = sink;
-    if (sink == null) return;
-
-    sink.onReset();
-
-    List<Msg> snapshot;
-    synchronized (transcript) { snapshot = new ArrayList<>(transcript); }
-    for (Msg m : snapshot) {
-      switch (m.role) {
-        case USER      -> sink.onUser(m.text);
-        case ASSISTANT -> sink.onAssistant(m.text);
-        case ERROR     -> sink.onError(m.text);
-      }
-    }
-  }
-
-  /** Clear current conversation (optional helper) */
-  public void clear() {
-    transcript.clear();
-    Sink s = sink;
-    if (s != null) s.onReset();
-  }
-
-  /** Main entry point used by tool window + inline popup. */
-  public void ask(@Nullable String selection, String question) {
-    final String prompt = (selection == null || selection.isBlank())
-        ? question
-        : question + "\n\n[Selection]\n" + selection;
-
-    recordAndNotify(Role.USER, question);
-
-    ApplicationManager.getApplication().executeOnPooledThread(() -> {
-      try {
-        String answer = ChatBotAPI.ask(prompt);
-        ApplicationManager.getApplication().invokeLater(() ->
-            recordAndNotify(Role.ASSISTANT, answer));
-      } catch (Exception ex) {
-        ApplicationManager.getApplication().invokeLater(() ->
-            recordAndNotify(Role.ERROR, "Request failed: " + ex.getMessage()));
-      }
-    });
-  }
-
-  private void recordAndNotify(Role role, String text) {
-    transcript.add(new Msg(role, text));
-    Sink s = sink;
-    if (s == null) return;
-    switch (role) {
-      case USER      -> s.onUser(text);
-      case ASSISTANT -> s.onAssistant(text);
-      case ERROR     -> s.onError(text);
-    }
-  }
-}
-
-package com.manideepr.chat;
-
 import com.intellij.openapi.project.Project;
 import com.intellij.openapi.wm.ToolWindow;
 import com.intellij.openapi.wm.ToolWindowFactory;
 import com.intellij.ui.SimpleToolWindowPanel;
-import com.intellij.ui.components.JBScrollPane;
-import com.intellij.ui.components.panels.VerticalBox;
 import com.intellij.ui.content.Content;
 import com.intellij.ui.content.ContentFactory;
 import com.intellij.util.Disposer;
-import com.intellij.util.ui.JBUI;
 import org.jetbrains.annotations.NotNull;
 
 import javax.swing.*;
@@ -116,12 +18,10 @@ public class ChatToolWindowFactory implements ToolWindowFactory {
   public void createToolWindowContent(@NotNull Project project, @NotNull ToolWindow toolWindow) {
     SimpleToolWindowPanel root = new SimpleToolWindowPanel(true, true);
 
-    // Messages area
-    VerticalBox messages = new VerticalBox();
-    messages.setBorder(JBUI.Borders.empty(8, 12));
-    JBScrollPane scroll = new JBScrollPane(messages);
+    // JCEF markdown chat view in the center
+    JcefMarkdownChatView view = new JcefMarkdownChatView();
 
-    // Input row
+    // Bottom input row (unchanged)
     ChatInputPanel input = new ChatInputPanel(text -> {
       if (!text.isBlank()) {
         ChatService.getInstance(project).ask(null, text);
@@ -129,35 +29,17 @@ public class ChatToolWindowFactory implements ToolWindowFactory {
     });
 
     JPanel content = new JPanel(new BorderLayout());
-    content.add(scroll, BorderLayout.CENTER);
+    content.add(view.getComponent(), BorderLayout.CENTER);
     content.add(input, BorderLayout.SOUTH);
     root.setContent(content);
 
-    // Wire service sink
+    // Wire service sink -> JCEF view
     ChatService chat = ChatService.getInstance(project);
     chat.setSink(new ChatService.Sink() {
-      @Override public void onReset() {
-        messages.removeAll();
-        messages.revalidate(); messages.repaint();
-      }
-      @Override public void onUser(String text) {
-        messages.add(ChatBubbles.user(text));
-        refresh();
-      }
-      @Override public void onAssistant(String text) {
-        messages.add(ChatBubbles.assistant(text));
-        refresh();
-      }
-      @Override public void onError(String message) {
-        messages.add(ChatBubbles.assistant("⚠️ " + message));
-        refresh();
-      }
-      private void refresh() {
-        messages.revalidate(); messages.repaint();
-        SwingUtilities.invokeLater(() ->
-            scroll.getVerticalScrollBar().setValue(
-                scroll.getVerticalScrollBar().getMaximum()));
-      }
+      @Override public void onReset() { view.clear(); }
+      @Override public void onUser(String text) { view.addUser(text); }
+      @Override public void onAssistant(String text) { view.addAssistant(text); }
+      @Override public void onError(String message) { view.addAssistant("```text\\n" + message + "\\n```"); }
     });
 
     Content tab = ContentFactory.getInstance().createContent(root, "Chat", false);
@@ -166,68 +48,271 @@ public class ChatToolWindowFactory implements ToolWindowFactory {
   }
 }
 
-package com.manideepr.chat.actions;
 
-import com.intellij.openapi.actionSystem.AnAction;
-import com.intellij.openapi.actionSystem.AnActionEvent;
-import com.intellij.openapi.actionSystem.CommonDataKeys;
-import com.intellij.openapi.editor.Editor;
-import com.intellij.openapi.editor.LogicalPosition;
-import com.intellij.openapi.project.Project;
-import com.intellij.openapi.ui.popup.JBPopupFactory;
-import com.intellij.ui.awt.RelativePoint;
-import com.intellij.ui.components.JBLabel;
-import com.intellij.util.ui.JBUI;
-import com.manideepr.chat.ChatService;
-import org.jetbrains.annotations.NotNull;
+
+package com.manideepr.chat;
+
+import com.intellij.ui.jcef.JBCefBrowser;
+import com.intellij.ui.jcef.JBCefJSQuery;
 
 import javax.swing.*;
 import java.awt.*;
+import java.awt.datatransfer.StringSelection;
 
-public class AskSelectionAction extends AnAction {
-  @Override
-  public void actionPerformed(@NotNull AnActionEvent e) {
-    Project project = e.getProject();
-    Editor editor = e.getData(CommonDataKeys.EDITOR);
-    if (project == null || editor == null) return;
+/**
+ * A JCEF-powered chat view that renders markdown (including fenced code blocks)
+ * and exposes addUser/addAssistant/clear methods.
+ */
+public final class JcefMarkdownChatView {
+  private final JBCefBrowser browser;
+  private final JBCefJSQuery copyQuery;
 
-    String selected = editor.getSelectionModel().getSelectedText();
+  public JcefMarkdownChatView() {
+    this.browser = new JBCefBrowser();
+    this.copyQuery = JBCefJSQuery.create(browser);
 
-    JPanel panel = new JPanel(new BorderLayout(6,6));
-    panel.setBorder(JBUI.Borders.empty(8));
-    panel.add(new JBLabel("Ask about selection:"), BorderLayout.NORTH);
-
-    JTextField field = new JTextField();
-    panel.add(field, BorderLayout.CENTER);
-
-    var popup = JBPopupFactory.getInstance()
-        .createComponentPopupBuilder(panel, field)
-        .setRequestFocus(true)
-        .setMovable(true)
-        .setResizable(true)
-        .createPopup();
-
-    // Show below the caret
-    LogicalPosition pos = editor.getCaretModel().getLogicalPosition();
-    Point caretPoint = editor.logicalPositionToXY(pos);
-    caretPoint.translate(0, editor.getLineHeight());
-    popup.show(new RelativePoint(editor.getContentComponent(), caretPoint));
-
-    field.addActionListener(ev -> {
-      String question = field.getText().trim();
-      popup.cancel();
-      if (question.isEmpty()) return;
-
-      var tw = com.intellij.openapi.wm.ToolWindowManager.getInstance(project).getToolWindow("Chat");
-      if (tw != null) {
-        // Activate tool window first, then ask (ensures sink is set so user bubble shows)
-        tw.activate(() -> ChatService.getInstance(project).ask(selected, question), true);
-      } else {
-        ChatService.getInstance(project).ask(selected, question);
-      }
+    // Handle "Copy" from JS -> Java -> System clipboard
+    copyQuery.addHandler(encoded -> {
+      try {
+        // encoded is already decoded via the injected JS (atob)
+        Toolkit.getDefaultToolkit().getSystemClipboard()
+            .setContents(new StringSelection(encoded), null);
+      } catch (Exception ignored) {}
+      return null;
     });
+
+    String html = buildHtml(copyQuery.inject("atob(arguments[0])"));
+    browser.loadHTML(html);
+  }
+
+  public JComponent getComponent() {
+    return browser.getComponent();
+  }
+
+  /** Clear the transcript DOM. */
+  public void clear() {
+    run("clearRoot();");
+  }
+
+  /** Append a user message (right-aligned bubble style). */
+  public void addUser(String markdown) {
+    run("appendMarkdown('user', " + toJsString(markdown) + ");");
+  }
+
+  /** Append an assistant message (left-aligned bubble style). */
+  public void addAssistant(String markdown) {
+    run("appendMarkdown('assistant', " + toJsString(markdown) + ");");
+  }
+
+  private void run(String js) {
+    browser.getCefBrowser().executeJavaScript(js, "about:blank", 0);
+  }
+
+  private static String toJsString(String s) {
+    if (s == null) s = "";
+    return "'" + s
+        .replace("\\", "\\\\")
+        .replace("'", "\\'")
+        .replace("\r", "\\r")
+        .replace("\n", "\\n") + "'";
+  }
+
+  /**
+   * Builds the static HTML with a tiny markdown renderer and a Copy bridge.
+   * We don't rely on external CDNs; everything is embedded here.
+   */
+  private static String buildHtml(String copyBridgeCall) {
+    return """
+      <!doctype html>
+      <html>
+      <head>
+        <meta charset="utf-8"/>
+        <meta http-equiv="Content-Security-Policy" content="default-src 'self' 'unsafe-inline' 'unsafe-eval' data:;">
+        <style>
+          :root {
+            --bg: #ffffff;
+            --fg: #1f2328;
+            --muted: #6e7781;
+            --bubble-user: #e6f3ff;
+            --bubble-assistant: #f6f8fa;
+            --code-bg: #0b1020;
+            --code-fg: #e6edf3;
+            --border: #d0d7de;
+          }
+          @media (prefers-color-scheme: dark) {
+            :root {
+              --bg: #0d1117;
+              --fg: #c9d1d9;
+              --muted: #8b949e;
+              --bubble-user: #172b3a;
+              --bubble-assistant: #161b22;
+              --code-bg: #0b1020;
+              --code-fg: #e6edf3;
+              --border: #30363d;
+            }
+          }
+          html, body {
+            margin: 0; padding: 0;
+            background: var(--bg); color: var(--fg);
+            font: 13px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans", "Liberation Sans", "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol", sans-serif;
+            overflow: hidden;
+          }
+          #root {
+            box-sizing: border-box;
+            padding: 12px 14px 80px 14px; /* extra space for bottom input in host UI */
+            height: 100vh;
+            overflow-y: auto;
+          }
+          .msg {
+            max-width: 840px;
+            border-radius: 12px;
+            padding: 10px 12px;
+            margin: 8px 0;
+            border: 1px solid var(--border);
+            word-wrap: break-word;
+            white-space: pre-wrap;
+          }
+          .user { margin-left: auto; background: var(--bubble-user); }
+          .assistant { margin-right: auto; background: var(--bubble-assistant); }
+          .msg p { margin: 8px 0 0 0; }
+          .msg p:first-child { margin-top: 0; }
+          .msg a { color: #1f6feb; text-decoration: none; }
+          .msg a:hover { text-decoration: underline; }
+
+          /* Inline code */
+          code.inline {
+            background: rgba(110, 118, 129, 0.2);
+            padding: 1px 4px;
+            border-radius: 6px;
+            font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+            font-size: 12px;
+          }
+
+          /* Code block wrapper */
+          .codewrap {
+            position: relative;
+            margin: 8px 0;
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            background: var(--code-bg);
+            color: var(--code-fg);
+          }
+          .codewrap .toolbar {
+            position: absolute;
+            top: 6px; right: 8px;
+            display: flex; gap: 6px;
+          }
+          .codewrap .toolbar button {
+            border: 1px solid var(--border);
+            background: rgba(240,240,240,.1);
+            color: var(--fg);
+            border-radius: 6px;
+            font-size: 12px;
+            padding: 2px 6px;
+            cursor: pointer;
+          }
+          .codewrap pre {
+            margin: 0; padding: 30px 12px 12px 12px; /* leave space for toolbar */
+            overflow: auto;
+          }
+          .codewrap code {
+            font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+            font-size: 12px;
+            white-space: pre;
+          }
+          .lang-badge {
+            position: absolute; left: 10px; top: 8px;
+            font-size: 11px; color: var(--muted);
+          }
+        </style>
+      </head>
+      <body>
+        <div id="root"></div>
+
+        <script>
+          // ====== utilities ======
+          function esc(s) {
+            return s.replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');
+          }
+
+          // Very small markdown-ish renderer with fenced code blocks:
+          // Supports: paragraphs, **bold**, *italic*, `inline`, [link](url), and ```lang ... ```
+          function renderMarkdown(md) {
+            if (!md) return '';
+            const codeBlocks = [];
+            // 1) Extract fenced code blocks into placeholders
+            md = md.replace(/```([A-Za-z0-9_+.-]*)\\n([\\s\\S]*?)```/g, function(_, lang, code) {
+              const i = codeBlocks.push({ lang: (lang||'text'), code }) - 1;
+              return '@@CODEBLOCK_' + i + '@@';
+            });
+
+            // 2) Escape the rest
+            md = esc(md);
+
+            // 3) Inline formatting (order matters)
+            md = md
+              .replace(/\\*\\*([^*]+)\\*\\*/g, '<strong>$1</strong>')
+              .replace(/\\*([^*]+)\\*/g, '<em>$1</em>')
+              .replace(/`([^`]+)`/g, '<code class="inline">$1</code>')
+              .replace(/\\[([^\\]]+)\\]\\((https?:\\/\\/[^)]+)\\)/g, '<a href="$2" target="_blank" rel="noreferrer">$1</a>');
+
+            // 4) Convert line breaks into paragraphs
+            md = '<p>' + md.replace(/\\n{2,}/g, '</p><p>').replace(/\\n/g,'<br/>') + '</p>';
+
+            // 5) Restore code blocks
+            md = md.replace(/@@CODEBLOCK_(\\d+)@@/g, function(_, idx) {
+              const blk = codeBlocks[Number(idx)];
+              const lang = (blk.lang || 'text').trim();
+              const codeEscaped = esc(blk.code ?? '');
+              const encoded = btoa(blk.code ?? '');
+              const langBadge = '<span class="lang-badge">' + esc(lang) + '</span>';
+              return (
+                '<div class="codewrap">' +
+                  '<div class="toolbar">' +
+                    '<button onclick="__copy(\\'' + encoded + '\\')">Copy</button>' +
+                  '</div>' +
+                  langBadge +
+                  '<pre><code data-lang="' + esc(lang) + '">' + codeEscaped + '</code></pre>' +
+                '</div>'
+              );
+            });
+
+            return md;
+          }
+
+          function addMessage(role, html) {
+            var el = document.createElement('div');
+            el.className = 'msg ' + role;
+            el.innerHTML = html;
+            document.getElementById('root').appendChild(el);
+            // autoscroll
+            requestAnimationFrame(() => { window.scrollToBottom(); });
+          }
+
+          window.scrollToBottom = function() {
+            const root = document.getElementById('root');
+            root.scrollTop = root.scrollHeight;
+          }
+
+          // exposed to Java
+          window.appendMarkdown = function(role, md) {
+            const html = renderMarkdown(md);
+            addMessage(role, html);
+          };
+          window.clearRoot = function() {
+            const root = document.getElementById('root');
+            root.innerHTML = '';
+          };
+
+          // Copy bridge injected from Java:
+          const __copyBridge = %s;
+          window.__copy = function(encoded) {
+            // pass decoded text to Java
+            __copyBridge(encoded);
+          };
+        </script>
+      </body>
+      </html>
+      """.formatted(copyBridgeCall);
   }
 }
-
-
-
