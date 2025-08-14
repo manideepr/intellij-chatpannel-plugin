@@ -331,3 +331,131 @@ public class AskSelectionAction extends AnAction {
     });
   }
 }
+
+
+
+package com.manideepr.chat;
+
+import com.intellij.openapi.application.ApplicationManager;
+import com.intellij.openapi.components.Service;
+import com.intellij.openapi.project.Project;
+import org.chatbot.ChatBotAPI; // <- your existing class
+
+import org.jetbrains.annotations.Nullable;
+
+@Service(Service.Level.PROJECT)
+public final class ChatService {
+
+  public interface Sink {
+    void onUser(String text);
+    void onAssistant(String text);
+    void onError(String message);
+  }
+
+  private volatile @Nullable Sink sink;
+
+  public static ChatService getInstance(Project project) {
+    return project.getService(ChatService.class);
+  }
+
+  /** Tool window sets this once so it can receive updates. */
+  public void setSink(@Nullable Sink sink) {
+    this.sink = sink;
+  }
+
+  /** Entry used by tool window + inline popup. */
+  public void ask(@Nullable String selection, String question) {
+    final Sink s = sink;
+    if (s != null) s.onUser(question);
+
+    final String prompt = (selection == null || selection.isBlank())
+        ? question
+        : question + "\n\n[Selection]\n" + selection;
+
+    ApplicationManager.getApplication().executeOnPooledThread(() -> {
+      try {
+        String answer = ChatBotAPI.ask(prompt); // blocking call to your server
+        ApplicationManager.getApplication().invokeLater(() -> {
+          Sink current = this.sink;
+          if (current != null) current.onAssistant(answer);
+        });
+      } catch (Exception ex) {
+        ApplicationManager.getApplication().invokeLater(() -> {
+          Sink current = this.sink;
+          if (current != null) current.onError("Request failed: " + ex.getMessage());
+        });
+      }
+    });
+  }
+}
+
+
+package com.manideepr.chat;
+
+import com.intellij.openapi.project.Project;
+import com.intellij.openapi.wm.ToolWindow;
+import com.intellij.openapi.wm.ToolWindowFactory;
+import com.intellij.ui.SimpleToolWindowPanel;
+import com.intellij.ui.components.JBScrollPane;
+import com.intellij.ui.components.panels.VerticalBox;
+import com.intellij.ui.content.Content;
+import com.intellij.ui.content.ContentFactory;
+import com.intellij.util.Disposer;
+import com.intellij.util.ui.JBUI;
+import org.jetbrains.annotations.NotNull;
+
+import javax.swing.*;
+import java.awt.*;
+
+public class ChatToolWindowFactory implements ToolWindowFactory {
+
+  @Override
+  public void createToolWindowContent(@NotNull Project project, @NotNull ToolWindow toolWindow) {
+    // Root panel with (optional) toolbar + content
+    SimpleToolWindowPanel root = new SimpleToolWindowPanel(true, true);
+
+    // Messages area (stack of bubbles)
+    VerticalBox messages = new VerticalBox();
+    messages.setBorder(JBUI.Borders.empty(8, 12));
+    JBScrollPane scroll = new JBScrollPane(messages);
+
+    // Input row (Enter to send)
+    ChatInputPanel input = new ChatInputPanel(text -> {
+      if (!text.isBlank()) {
+        ChatService.getInstance(project).ask(null, text);
+      }
+    });
+
+    JPanel content = new JPanel(new BorderLayout());
+    content.add(scroll, BorderLayout.CENTER);
+    content.add(input, BorderLayout.SOUTH);
+    root.setContent(content);
+
+    // Wire the service sink so responses appear here
+    ChatService chat = ChatService.getInstance(project);
+    chat.setSink(new ChatService.Sink() {
+      @Override public void onUser(String text) {
+        messages.add(ChatBubbles.user(text));
+        refresh();
+      }
+      @Override public void onAssistant(String text) {
+        messages.add(ChatBubbles.assistant(text));
+        refresh();
+      }
+      @Override public void onError(String message) {
+        messages.add(ChatBubbles.assistant("⚠️ " + message));
+        refresh();
+      }
+      private void refresh() {
+        messages.revalidate(); messages.repaint();
+        SwingUtilities.invokeLater(() ->
+            scroll.getVerticalScrollBar().setValue(scroll.getVerticalScrollBar().getMaximum()));
+      }
+    });
+
+    // Unset sink when the tab is disposed
+    Content tab = ContentFactory.getInstance().createContent(root, "Chat", false);
+    Disposer.register(tab, () -> ChatService.getInstance(project).setSink(null));
+    toolWindow.getContentManager().addContent(tab);
+  }
+}
