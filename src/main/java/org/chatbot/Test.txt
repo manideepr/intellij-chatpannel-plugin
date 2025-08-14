@@ -1,0 +1,164 @@
+package com.example.chat;
+
+import com.intellij.openapi.project.Project;
+import com.intellij.openapi.wm.ToolWindow;
+import com.intellij.openapi.wm.ToolWindowFactory;
+import com.intellij.openapi.actionSystem.*;
+import com.intellij.ui.content.*;
+import com.intellij.ui.components.JBScrollPane;
+import com.intellij.ui.components.panels.VerticalBox;
+import com.intellij.ui.components.JBPanel;
+import com.intellij.util.ui.JBUI;
+import com.intellij.ui.SimpleToolWindowPanel;
+import org.jetbrains.annotations.NotNull;
+
+import javax.swing.*;
+import java.awt.*;
+
+public class ChatToolWindowFactory implements ToolWindowFactory {
+  @Override
+  public void createToolWindowContent(@NotNull Project project, @NotNull ToolWindow toolWindow) {
+    SimpleToolWindowPanel root = new SimpleToolWindowPanel(true, true);
+
+    // Toolbar (top)
+    DefaultActionGroup group = new DefaultActionGroup();
+    group.add(ActionManager.getInstance().getAction("Chat.NewConversation"));
+    group.add(ActionManager.getInstance().getAction("Chat.Clear"));
+    group.addSeparator();
+    group.add(new AnAction("Settings", "Chat Settings", null) {
+      @Override public void actionPerformed(@NotNull AnActionEvent e) { /* open settings */ }
+    });
+    ActionToolbar toolbar = ActionManager.getInstance().createActionToolbar("ChatToolbar", group, true);
+    root.setToolbar(toolbar.getComponent());
+
+    // Messages panel (center)
+    VerticalBox messages = new VerticalBox(); // stack “bubbles”
+    messages.setBorder(JBUI.Borders.empty(8, 12));
+    JBScrollPane scroll = new JBScrollPane(messages);
+    root.setContent(scroll);
+
+    // Input (bottom)
+    ChatInputPanel input = new ChatInputPanel(project, text -> {
+      // append message bubble(s) + trigger your request/streaming here
+      messages.add(ChatBubbles.user(text));
+      messages.revalidate(); messages.repaint();
+    });
+    root.setContent(new ChatWithInput(root.getContent(), input));
+
+    Content content = ContentFactory.getInstance().createContent(root, "Chat", false);
+    toolWindow.getContentManager().addContent(content);
+  }
+
+  // Simple two-row layout: [messages scroll] + [input box]
+  static class ChatWithInput extends JBPanel<ChatWithInput> {
+    public ChatWithInput(Component center, JComponent bottom) {
+      super(new BorderLayout());
+      add(center, BorderLayout.CENTER);
+      add(bottom, BorderLayout.SOUTH);
+    }
+  }
+}
+
+
+import com.intellij.ui.jcef.JBCefBrowser;
+import com.intellij.ui.jcef.JBCefJSQuery;
+
+public class HtmlChatView extends JPanel {
+  private final JBCefBrowser browser;
+  private final JBCefJSQuery copyQuery;
+
+  public HtmlChatView() {
+    super(new BorderLayout());
+    browser = new JBCefBrowser();
+    copyQuery = JBCefJSQuery.create((JBCefBrowser) browser);
+    copyQuery.addHandler(text -> { 
+      Toolkit.getDefaultToolkit().getSystemClipboard()
+        .setContents(new StringSelection(text), null);
+      return null;
+    });
+    String html = """
+      <html><head>
+        <meta charset="utf-8"/>
+        <style>
+          body { margin: 8px 12px; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+          .msg { padding: 8px 12px; border-radius: 10px; margin: 8px 0; }
+          .user { background: #2d7; opacity:.9; }  /* tune for Darcula via prefers-color-scheme */
+          .assistant { background: #eee; }
+          pre { padding: 8px; border-radius: 8px; overflow:auto; }
+          .toolbar { position:absolute; right:8px; top:8px; }
+          button { border:0; padding:4px 6px; border-radius:6px; }
+        </style></head>
+        <body id="root"></body>
+        <script>
+          const copyBridge = %s; // injected
+          function addMessage(role, html) {
+            const el = document.createElement('div');
+            el.className = 'msg ' + role;
+            el.innerHTML = html;
+            document.getElementById('root').appendChild(el);
+            window.scrollTo(0, document.body.scrollHeight);
+          }
+          function addCode(code) {
+            const wrap = document.createElement('div');
+            wrap.className = 'msg assistant';
+            wrap.innerHTML = `<div class="toolbar"><button onclick="copyBridge('${"$"}{btoa(code)}')">Copy</button></div>
+              <pre><code>${"$"}{code.replace(/[&<>]/g, m=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[m]))}</code></pre>`;
+            document.getElementById('root').appendChild(wrap);
+            window.scrollTo(0, document.body.scrollHeight);
+          }
+        </script>
+      </html>
+      """.formatted(copyQuery.inject("atob(arguments[0])"));
+    browser.loadHTML(html);
+    add(browser.getComponent(), BorderLayout.CENTER);
+  }
+
+  public void addUser(String markdownHtml) {
+    browser.getCefBrowser().executeJavaScript("addMessage('user', " + toJsString(markdownHtml) + ")", "", 0);
+  }
+  public void addAssistant(String markdownHtml) {
+    browser.getCefBrowser().executeJavaScript("addMessage('assistant', " + toJsString(markdownHtml) + ")", "", 0);
+  }
+  public void addCode(String code) {
+    browser.getCefBrowser().executeJavaScript("addCode(" + toJsString(code) + ")", "", 0);
+  }
+
+  private static String toJsString(String s) {
+    return "'" + s.replace("\\","\\\\").replace("'","\\'").replace("\n","\\n") + "'";
+  }
+}
+
+
+
+import com.intellij.openapi.project.Project;
+import com.intellij.ui.components.JBPanel;
+import com.intellij.ui.components.JBTextField;
+import com.intellij.util.ui.JBUI;
+
+import javax.swing.*;
+import java.awt.*;
+import java.util.function.Consumer;
+
+public class ChatInputPanel extends JBPanel<ChatInputPanel> {
+  public ChatInputPanel(Project project, Consumer<String> onSend) {
+    super(new BorderLayout(6, 6));
+    setBorder(JBUI.Borders.empty(6, 10));
+
+    JTextArea area = new JTextArea(3, 20);
+    area.setLineWrap(true); area.setWrapStyleWord(true);
+
+    JButton send = new JButton("Send");
+    send.addActionListener(e -> {
+      String text = area.getText().trim();
+      if (!text.isEmpty()) { onSend.accept(text); area.setText(""); }
+    });
+    area.getInputMap().put(KeyStroke.getKeyStroke("ENTER"), "send");
+    area.getActionMap().put("send", new AbstractAction() {
+      public void actionPerformed(java.awt.event.ActionEvent e) { send.doClick(); }
+    });
+
+    add(new JScrollPane(area), BorderLayout.CENTER);
+    add(send, BorderLayout.EAST);
+  }
+}
+
