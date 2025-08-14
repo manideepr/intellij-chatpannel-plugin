@@ -277,4 +277,57 @@ public class AskSelectionAction extends AnAction {
 }
 
 
+package com.manideepr.chat.actions;
 
+import com.intellij.openapi.actionSystem.AnAction;
+import com.intellij.openapi.actionSystem.AnActionEvent;
+import com.intellij.openapi.actionSystem.CommonDataKeys;
+import com.intellij.openapi.editor.Editor;
+import com.intellij.openapi.editor.LogicalPosition;
+import com.intellij.openapi.project.Project;
+import com.intellij.openapi.ui.popup.JBPopupFactory;
+import com.intellij.ui.awt.RelativePoint;          // <-- add this import
+import com.intellij.ui.components.JBLabel;
+import com.intellij.util.ui.JBUI;
+import org.jetbrains.annotations.NotNull;
+
+import javax.swing.*;
+import java.awt.*;
+
+public class AskSelectionAction extends AnAction {
+  @Override
+  public void actionPerformed(@NotNull AnActionEvent e) {
+    Project project = e.getProject();
+    Editor editor = e.getData(CommonDataKeys.EDITOR);
+    if (project == null || editor == null) return;
+
+    String selected = editor.getSelectionModel().getSelectedText();
+
+    JPanel panel = new JPanel(new BorderLayout(6,6));
+    panel.setBorder(JBUI.Borders.empty(8));
+    panel.add(new JBLabel("Ask about selection:"), BorderLayout.NORTH);
+
+    JTextField field = new JTextField();
+    panel.add(field, BorderLayout.CENTER);
+
+    var popup = JBPopupFactory.getInstance()
+        .createComponentPopupBuilder(panel, field)
+        .setRequestFocus(true)
+        .setMovable(true)
+        .setResizable(true)
+        .createPopup();
+
+    // Place popup near the caret (slightly below it)
+    LogicalPosition pos = editor.getCaretModel().getLogicalPosition();
+    Point caretPoint = editor.logicalPositionToXY(pos);   // editor coords
+    caretPoint.translate(0, editor.getLineHeight());      // nudge below caret (or +20)
+
+    popup.show(new RelativePoint(editor.getContentComponent(), caretPoint));
+
+    field.addActionListener(ev -> {
+      String question = field.getText().trim();
+      popup.cancel();
+      // TODO: route (selected, question) to your chat service and open the tool window if needed
+    });
+  }
+}
