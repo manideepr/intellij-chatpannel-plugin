@@ -1,138 +1,131 @@
-package com.example.chat;
+<!-- Make sure you already have the base depends -->
+<depends>com.intellij.modules.platform</depends>
+
+<extensions defaultExtensionNs="com.intellij">
+  <!-- Copilot-style side panel -->
+  <toolWindow
+      id="Chat"
+      anchor="right"
+      canCloseContents="true"
+      factoryClass="com.manideepr.chat.ChatToolWindowFactory"/>
+</extensions>
+
+<actions>
+  <!-- Toolbar + Menu action to open/activate the Chat tool window -->
+  <action id="Chat.ToggleToolWindow"
+          class="com.manideepr.chat.actions.ToggleChatAction"
+          text="Open Chat"
+          icon="AllIcons.Toolwindows.ToolWindowMessages">
+    <add-to-group group-id="MainToolbarRight" anchor="last"/>
+    <keyboard-shortcut first-keystroke="ctrl shift BACK_SLASH" keymap="$default"/>
+  </action>
+
+  <!-- Editor right-click: inline ask about selection (like Copilot inline) -->
+  <action id="Chat.AskAboutSelection"
+          class="com.manideepr.chat.actions.AskSelectionAction"
+          text="Ask Chat About Selection"
+          icon="AllIcons.Actions.IntentionBulb">
+    <add-to-group group-id="EditorPopupMenu" anchor="last"/>
+  </action>
+</actions>
+
+
+package com.manideepr.chat;
 
 import com.intellij.openapi.project.Project;
 import com.intellij.openapi.wm.ToolWindow;
 import com.intellij.openapi.wm.ToolWindowFactory;
 import com.intellij.openapi.actionSystem.*;
-import com.intellij.ui.content.*;
+import com.intellij.ui.content.Content;
+import com.intellij.ui.content.ContentFactory;
+import com.intellij.ui.SimpleToolWindowPanel;
 import com.intellij.ui.components.JBScrollPane;
 import com.intellij.ui.components.panels.VerticalBox;
-import com.intellij.ui.components.JBPanel;
 import com.intellij.util.ui.JBUI;
-import com.intellij.ui.SimpleToolWindowPanel;
 import org.jetbrains.annotations.NotNull;
 
 import javax.swing.*;
 import java.awt.*;
 
 public class ChatToolWindowFactory implements ToolWindowFactory {
+
   @Override
   public void createToolWindowContent(@NotNull Project project, @NotNull ToolWindow toolWindow) {
+    // Root panel with toolbar (top) + content (center)
     SimpleToolWindowPanel root = new SimpleToolWindowPanel(true, true);
 
-    // Toolbar (top)
+    // Tool window toolbar
     DefaultActionGroup group = new DefaultActionGroup();
-    group.add(ActionManager.getInstance().getAction("Chat.NewConversation"));
-    group.add(ActionManager.getInstance().getAction("Chat.Clear"));
+    group.add(ActionManager.getInstance().getAction("Chat.ToggleToolWindow")); // reuse “Open Chat”
     group.addSeparator();
-    group.add(new AnAction("Settings", "Chat Settings", null) {
-      @Override public void actionPerformed(@NotNull AnActionEvent e) { /* open settings */ }
-    });
-    ActionToolbar toolbar = ActionManager.getInstance().createActionToolbar("ChatToolbar", group, true);
+    group.add(new StopStreamingAction());
+    group.add(new NewConversationAction());
+    group.add(new ClearChatAction());
+
+    ActionToolbar toolbar = ActionManager.getInstance()
+        .createActionToolbar("ChatToolbar", group, true);
     root.setToolbar(toolbar.getComponent());
 
-    // Messages panel (center)
-    VerticalBox messages = new VerticalBox(); // stack “bubbles”
+    // Messages area
+    VerticalBox messages = new VerticalBox(); // stacks bubbles top→bottom
     messages.setBorder(JBUI.Borders.empty(8, 12));
     JBScrollPane scroll = new JBScrollPane(messages);
-    root.setContent(scroll);
 
-    // Input (bottom)
-    ChatInputPanel input = new ChatInputPanel(project, text -> {
-      // append message bubble(s) + trigger your request/streaming here
+    // Input row
+    ChatInputPanel input = new ChatInputPanel(text -> {
+      if (text.isBlank()) return;
       messages.add(ChatBubbles.user(text));
       messages.revalidate(); messages.repaint();
-    });
-    root.setContent(new ChatWithInput(root.getContent(), input));
 
-    Content content = ContentFactory.getInstance().createContent(root, "Chat", false);
-    toolWindow.getContentManager().addContent(content);
+      // TODO: call your backend here and stream tokens into the last assistant bubble
+      // For now just echo:
+      messages.add(ChatBubbles.assistant("You said: " + text));
+      messages.revalidate(); messages.repaint();
+      SwingUtilities.invokeLater(() ->
+          scroll.getVerticalScrollBar().setValue(scroll.getVerticalScrollBar().getMaximum()));
+    });
+
+    JPanel content = new JPanel(new BorderLayout());
+    content.add(scroll, BorderLayout.CENTER);
+    content.add(input, BorderLayout.SOUTH);
+    root.setContent(content);
+
+    Content tab = ContentFactory.getInstance().createContent(root, "Chat", false);
+    toolWindow.getContentManager().addContent(tab);
   }
 
-  // Simple two-row layout: [messages scroll] + [input box]
-  static class ChatWithInput extends JBPanel<ChatWithInput> {
-    public ChatWithInput(Component center, JComponent bottom) {
-      super(new BorderLayout());
-      add(center, BorderLayout.CENTER);
-      add(bottom, BorderLayout.SOUTH);
+  // Minimal stub actions for toolbar — customize as needed
+  private static class NewConversationAction extends AnAction {
+    NewConversationAction() { super("New", "Start new conversation", null); }
+    @Override public void actionPerformed(@NotNull AnActionEvent e) {
+      // TODO: clear state / start new chat session
+    }
+  }
+
+  private static class ClearChatAction extends AnAction {
+    ClearChatAction() { super("Clear", "Clear messages", null); }
+    @Override public void actionPerformed(@NotNull AnActionEvent e) {
+      // ToolWindow content is our SimpleToolWindowPanel
+      ToolWindow tw = e.getData(PlatformDataKeys.TOOL_WINDOW);
+      if (tw == null) return;
+      JComponent comp = tw.getContentManager().getSelectedContent().getComponent();
+      // naive clear: rebuild center content
+      // (or keep a reference to messages panel in a project service)
+      for (Component c : ((JPanel)((JPanel)comp).getComponent(0)).getComponents()) { /* noop */ }
+    }
+  }
+
+  private static class StopStreamingAction extends AnAction {
+    StopStreamingAction() { super("Stop", "Stop streaming", null); }
+    @Override public void actionPerformed(@NotNull AnActionEvent e) {
+      // TODO: signal your streaming job to stop
     }
   }
 }
 
+package com.manideepr.chat;
 
-import com.intellij.ui.jcef.JBCefBrowser;
-import com.intellij.ui.jcef.JBCefJSQuery;
-
-public class HtmlChatView extends JPanel {
-  private final JBCefBrowser browser;
-  private final JBCefJSQuery copyQuery;
-
-  public HtmlChatView() {
-    super(new BorderLayout());
-    browser = new JBCefBrowser();
-    copyQuery = JBCefJSQuery.create((JBCefBrowser) browser);
-    copyQuery.addHandler(text -> { 
-      Toolkit.getDefaultToolkit().getSystemClipboard()
-        .setContents(new StringSelection(text), null);
-      return null;
-    });
-    String html = """
-      <html><head>
-        <meta charset="utf-8"/>
-        <style>
-          body { margin: 8px 12px; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
-          .msg { padding: 8px 12px; border-radius: 10px; margin: 8px 0; }
-          .user { background: #2d7; opacity:.9; }  /* tune for Darcula via prefers-color-scheme */
-          .assistant { background: #eee; }
-          pre { padding: 8px; border-radius: 8px; overflow:auto; }
-          .toolbar { position:absolute; right:8px; top:8px; }
-          button { border:0; padding:4px 6px; border-radius:6px; }
-        </style></head>
-        <body id="root"></body>
-        <script>
-          const copyBridge = %s; // injected
-          function addMessage(role, html) {
-            const el = document.createElement('div');
-            el.className = 'msg ' + role;
-            el.innerHTML = html;
-            document.getElementById('root').appendChild(el);
-            window.scrollTo(0, document.body.scrollHeight);
-          }
-          function addCode(code) {
-            const wrap = document.createElement('div');
-            wrap.className = 'msg assistant';
-            wrap.innerHTML = `<div class="toolbar"><button onclick="copyBridge('${"$"}{btoa(code)}')">Copy</button></div>
-              <pre><code>${"$"}{code.replace(/[&<>]/g, m=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[m]))}</code></pre>`;
-            document.getElementById('root').appendChild(wrap);
-            window.scrollTo(0, document.body.scrollHeight);
-          }
-        </script>
-      </html>
-      """.formatted(copyQuery.inject("atob(arguments[0])"));
-    browser.loadHTML(html);
-    add(browser.getComponent(), BorderLayout.CENTER);
-  }
-
-  public void addUser(String markdownHtml) {
-    browser.getCefBrowser().executeJavaScript("addMessage('user', " + toJsString(markdownHtml) + ")", "", 0);
-  }
-  public void addAssistant(String markdownHtml) {
-    browser.getCefBrowser().executeJavaScript("addMessage('assistant', " + toJsString(markdownHtml) + ")", "", 0);
-  }
-  public void addCode(String code) {
-    browser.getCefBrowser().executeJavaScript("addCode(" + toJsString(code) + ")", "", 0);
-  }
-
-  private static String toJsString(String s) {
-    return "'" + s.replace("\\","\\\\").replace("'","\\'").replace("\n","\\n") + "'";
-  }
-}
-
-
-
-import com.intellij.openapi.project.Project;
 import com.intellij.ui.components.JBPanel;
-import com.intellij.ui.components.JBTextField;
 import com.intellij.util.ui.JBUI;
 
 import javax.swing.*;
@@ -140,25 +133,148 @@ import java.awt.*;
 import java.util.function.Consumer;
 
 public class ChatInputPanel extends JBPanel<ChatInputPanel> {
-  public ChatInputPanel(Project project, Consumer<String> onSend) {
+  public ChatInputPanel(Consumer<String> onSend) {
     super(new BorderLayout(6, 6));
     setBorder(JBUI.Borders.empty(6, 10));
 
     JTextArea area = new JTextArea(3, 20);
-    area.setLineWrap(true); area.setWrapStyleWord(true);
+    area.setLineWrap(true);
+    area.setWrapStyleWord(true);
+    JScrollPane scroll = new JScrollPane(area);
 
     JButton send = new JButton("Send");
     send.addActionListener(e -> {
       String text = area.getText().trim();
       if (!text.isEmpty()) { onSend.accept(text); area.setText(""); }
     });
+
+    // Enter to send
     area.getInputMap().put(KeyStroke.getKeyStroke("ENTER"), "send");
     area.getActionMap().put("send", new AbstractAction() {
-      public void actionPerformed(java.awt.event.ActionEvent e) { send.doClick(); }
+      @Override public void actionPerformed(java.awt.event.ActionEvent e) { send.doClick(); }
     });
 
-    add(new JScrollPane(area), BorderLayout.CENTER);
+    add(scroll, BorderLayout.CENTER);
     add(send, BorderLayout.EAST);
   }
 }
+
+package com.manideepr.chat;
+
+import com.intellij.ui.JBColor;
+import com.intellij.util.ui.JBUI;
+
+import javax.swing.*;
+import java.awt.*;
+
+public final class ChatBubbles {
+  public static JComponent user(String text) { return bubble(text, true); }
+  public static JComponent assistant(String text) { return bubble(text, false); }
+
+  private static JComponent bubble(String text, boolean isUser) {
+    JPanel row = new JPanel(new BorderLayout());
+    row.setOpaque(false);
+
+    JPanel bubble = new JPanel();
+    bubble.setLayout(new BoxLayout(bubble, BoxLayout.Y_AXIS));
+    bubble.setBorder(JBUI.Borders.empty(8, 10));
+    bubble.setBackground(isUser
+        ? new JBColor(0xE0F7FA, 0x29434E)      // light/dark variants
+        : new JBColor(0xF5F5F5, 0x2B2D30));
+    bubble.setOpaque(true);
+
+    JLabel label = new JLabel("<html>" + escape(text).replace("\n","<br/>") + "</html>");
+    bubble.add(label);
+
+    // align user right, assistant left
+    row.add(bubble, isUser ? BorderLayout.EAST : BorderLayout.WEST);
+    return row;
+  }
+
+  private static String escape(String s){
+    return s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;");
+  }
+}
+
+
+
+package com.manideepr.chat.actions;
+
+import com.intellij.openapi.actionSystem.AnAction;
+import com.intellij.openapi.actionSystem.AnActionEvent;
+import com.intellij.openapi.project.Project;
+import com.intellij.openapi.wm.ToolWindow;
+import com.intellij.openapi.wm.ToolWindowManager;
+import org.jetbrains.annotations.NotNull;
+
+public class ToggleChatAction extends AnAction {
+  @Override
+  public void actionPerformed(@NotNull AnActionEvent e) {
+    Project project = e.getProject();
+    if (project == null) return;
+    ToolWindow tw = ToolWindowManager.getInstance(project).getToolWindow("Chat");
+    if (tw != null) tw.activate(null, true);
+  }
+}
+
+
+package com.manideepr.chat.actions;
+
+import com.intellij.openapi.actionSystem.AnAction;
+import com.intellij.openapi.actionSystem.AnActionEvent;
+import com.intellij.openapi.actionSystem.CommonDataKeys;
+import com.intellij.openapi.editor.Editor;
+import com.intellij.openapi.editor.LogicalPosition;
+import com.intellij.openapi.project.Project;
+import com.intellij.openapi.ui.popup.JBPopupFactory;
+import com.intellij.ui.components.JBLabel;
+import com.intellij.util.ui.JBUI;
+import org.jetbrains.annotations.NotNull;
+
+import javax.swing.*;
+import java.awt.*;
+
+public class AskSelectionAction extends AnAction {
+  @Override
+  public void actionPerformed(@NotNull AnActionEvent e) {
+    Project project = e.getProject();
+    Editor editor = e.getData(CommonDataKeys.EDITOR);
+    if (project == null || editor == null) return;
+
+    String selected = editor.getSelectionModel().getSelectedText();
+
+    JPanel panel = new JPanel(new BorderLayout(6,6));
+    panel.setBorder(JBUI.Borders.empty(8));
+    panel.add(new JBLabel("Ask about selection:"), BorderLayout.NORTH);
+
+    JTextField field = new JTextField();
+    panel.add(field, BorderLayout.CENTER);
+
+    var popup = JBPopupFactory.getInstance()
+        .createComponentPopupBuilder(panel, field)
+        .setRequestFocus(true)
+        .setMovable(true)
+        .setResizable(true)
+        .createPopup();
+
+    LogicalPosition pos = editor.getCaretModel().getLogicalPosition();
+    Point p = editor.logicalPositionToXY(pos);
+    popup.showInScreenCoordinates(editor.getContentComponent(),
+        editor.getContentComponent().getLocationOnScreen().translate(p.x, p.y + 20));
+
+    field.addActionListener(ev -> {
+      String question = field.getText().trim();
+      popup.cancel();
+      // TODO: route (selected, question) to your chat service and also open the Chat tool window
+      // (You can store the last question in a ProjectService, then have the tool window consume it)
+    });
+  }
+
+  // tiny helper to translate a point
+  private static Point translate(this Point pt, int dx, int dy) {
+    return new Point(pt.x + dx, pt.y + dy);
+  }
+}
+
+
 
