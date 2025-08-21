@@ -1,1 +1,328 @@
+package com.manideepr.chat;
+
+import com.intellij.ui.jcef.JBCefBrowser;
+import com.intellij.ui.jcef.JBCefClient;
+import com.intellij.ui.jcef.JBCefJSQuery;
+import org.cef.browser.CefBrowser;
+import org.cef.handler.CefDisplayHandlerAdapter;
+
+import javax.swing.*;
+import java.awt.*;
+import java.awt.datatransfer.StringSelection;
+import java.nio.charset.StandardCharsets;
+import java.util.Base64;
+
+public final class JcefMarkdownChatView {
+  private final JBCefBrowser browser;
+  private final JBCefJSQuery copyQuery;
+
+  public JcefMarkdownChatView() {
+    this.browser = new JBCefBrowser();
+    this.copyQuery = JBCefJSQuery.create(browser);
+
+    // Bridge for "Copy" buttons in code blocks
+    copyQuery.addHandler(text -> {
+      Toolkit.getDefaultToolkit().getSystemClipboard()
+          .setContents(new StringSelection(text), null);
+      return null;
+    });
+
+    // Log JS console to IDE console for debugging
+    JBCefClient client = browser.getJbCefClient();
+    client.addDisplayHandler(new CefDisplayHandlerAdapter() {
+      @Override
+      public boolean onConsoleMessage(CefBrowser b, int level, String message, String source, int line) {
+        System.out.println("[JCEF] " + message + " (" + source + ":" + line + ")");
+        return false;
+      }
+    }, browser.getCefBrowser());
+
+    browser.loadHTML(buildHtml(copyQuery.inject("atob(arguments[0])")));
+  }
+
+  public JComponent getComponent() { return browser.getComponent(); }
+
+  public void clear() { run("clearRoot();"); }
+
+  public void addUser(String markdown) {
+    // Small strings: send directly (safer escaped)
+    run("appendMarkdown('user', " + toJsString(markdown) + ");");
+  }
+
+  public void addAssistant(String markdown) {
+    run("appendMarkdown('assistant', " + toJsString(markdown) + ");");
+  }
+
+  /** Show a spinner bubble with a stable id. */
+  public void addPendingAssistant(String id) {
+    run("addPending('assistant', " + toJsString(id) + ");");
+  }
+
+  /** Replace spinner with content (direct path for modest-size replies). */
+  public void resolvePending(String id, String markdown) {
+    run("resolvePending(" + toJsString(id) + ", " + toJsString(markdown) + ");");
+  }
+
+  /** Replace spinner with content using chunked Base64 (for large replies). */
+  public void resolvePendingLarge(String id, String markdown) {
+    // Base64 of UTF-8 bytes (safe for transport)
+    String b64 = Base64.getEncoder().encodeToString(markdown.getBytes(StandardCharsets.UTF_8));
+
+    // Send in chunks to avoid IPC size limits (8k chars per chunk is conservative)
+    int chunkSize = 8_000;
+    run("startBig(" + toJsString(id) + ");");
+    for (int i = 0; i < b64.length(); i += chunkSize) {
+      String part = b64.substring(i, Math.min(i + chunkSize, b64.length()));
+      run("appendBig(" + toJsString(id) + ", '" + part + "');");
+    }
+    run("finishBig(" + toJsString(id) + ");");
+  }
+
+  private void run(String js) {
+    browser.getCefBrowser().executeJavaScript(js, "about:blank", 0);
+  }
+
+  /** Escape more than just quotes: handle \n, \r, \u2028, \u2029, and NULs. */
+  private static String toJsString(String s) {
+    if (s == null) s = "";
+    return "'" + s
+        .replace("\\", "\\\\")
+        .replace("'", "\\'")
+        .replace("\r", "\\r")
+        .replace("\n", "\\n")
+        .replace("\u2028", "\\u2028")
+        .replace("\u2029", "\\u2029")
+        .replace("\u0000", "") + "'";
+  }
+
+  private static String buildHtml(String copyBridgeCall) {
+    return """
+      <!doctype html>
+      <html>
+      <head>
+        <meta charset="utf-8"/>
+        <meta http-equiv="Content-Security-Policy" content="default-src 'self' 'unsafe-inline' 'unsafe-eval' data:;">
+        <style>
+          :root { --bg:#fff; --fg:#1f2328; --muted:#6e7781; --bubble-user:#e6f3ff; --bubble-assistant:#f6f8fa;
+                  --code-bg:#0b1020; --code-fg:#e6edf3; --border:#d0d7de; }
+          @media (prefers-color-scheme: dark){
+            :root { --bg:#0d1117; --fg:#c9d1d9; --muted:#8b949e; --bubble-user:#172b3a; --bubble-assistant:#161b22;
+                    --code-bg:#0b1020; --code-fg:#e6edf3; --border:#30363d; }
+          }
+          html,body{margin:0;padding:0;background:var(--bg);color:var(--fg);font:13px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,"Noto Sans",sans-serif;overflow:hidden;}
+          #root{box-sizing:border-box;padding:12px 14px 80px;height:100vh;overflow-y:auto;}
+          .msg{max-width:840px;border-radius:12px;padding:10px 12px;margin:8px 0;border:1px solid var(--border);word-wrap:break-word;white-space:pre-wrap;}
+          .user{margin-left:auto;background:var(--bubble-user);}
+          .assistant{margin-right:auto;background:var(--bubble-assistant);}
+          .codewrap{position:relative;margin:8px 0;border:1px solid var(--border);border-radius:10px;background:var(--code-bg);color:var(--code-fg);}
+          .codewrap .toolbar{position:absolute;top:6px;right:8px;display:flex;gap:6px;}
+          .codewrap .toolbar button{border:1px solid var(--border);background:rgba(240,240,240,.1);color:var(--fg);border-radius:6px;font-size:12px;padding:2px 6px;cursor:pointer;}
+          .codewrap pre{margin:0;padding:30px 12px 12px;overflow:auto;}
+          .codewrap code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;font-size:12px;white-space:pre;}
+          .lang-badge{position:absolute;left:10px;top:8px;font-size:11px;color:var(--muted);}
+          .pending{display:flex;align-items:center;gap:8px;min-height:22px;}
+          .spinner{width:16px;height:16px;border-radius:50%;border:2px solid var(--border);border-top-color:transparent;animation:spin .8s linear infinite;}
+          @keyframes spin{to{transform:rotate(360deg)}}
+          .pending-text{color:var(--muted);font-size:12px;}
+        </style>
+      </head>
+      <body>
+        <div id="root"></div>
+        <script>
+          function esc(s){return s.replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');}
+
+          function renderMarkdown(md){
+            if(!md) return '';
+            const codeBlocks=[];
+            md=md.replace(/```([A-Za-z0-9_+.-]*)\\n([\\s\\S]*?)```/g,(_,lang,code)=>{
+              const i=codeBlocks.push({lang:(lang||'text'),code})-1; return '@@CODEBLOCK_'+i+'@@';
+            });
+            md=esc(md)
+              .replace(/\\*\\*([^*]+)\\*\\*/g,'<strong>$1</strong>')
+              .replace(/\\*([^*]+)\\*/g,'<em>$1</em>')
+              .replace(/`([^`]+)`/g,'<code class="inline">$1</code>')
+              .replace(/\\[([^\\]]+)\\]\\((https?:\\/\\/[^)]+)\\)/g,'<a href="$2" target="_blank" rel="noreferrer">$1</a>');
+            md='<p>'+md.replace(/\\n{2,}/g,'</p><p>').replace(/\\n/g,'<br/>')+'</p>';
+            md=md.replace(/@@CODEBLOCK_(\\d+)@@/g,(_,i)=>{
+              const blk=codeBlocks[+i]; const lang=(blk.lang||'text').trim();
+              const codeEsc=esc(blk.code??''); const encoded=btoa(blk.code??'');
+              return '<div class="codewrap"><div class="toolbar"><button onclick="__copy(\\''+encoded+'\\')">Copy</button></div>'
+                     + '<span class="lang-badge">'+esc(lang)+'</span>'
+                     + '<pre><code data-lang="'+esc(lang)+'">'+codeEsc+'</code></pre></div>';
+            });
+            return md;
+          }
+
+          function addMessage(role, html){
+            const el=document.createElement('div'); el.className='msg '+role; el.innerHTML=html;
+            document.getElementById('root').appendChild(el);
+            requestAnimationFrame(()=>window.scrollToBottom());
+          }
+          window.scrollToBottom=function(){ const root=document.getElementById('root'); root.scrollTop=root.scrollHeight; };
+
+          // Public API
+          window.appendMarkdown=(role,md)=>addMessage(role,renderMarkdown(md));
+          window.clearRoot=()=>{document.getElementById('root').innerHTML='';};
+
+          // Pending spinner helpers
+          window.addPending=(role,id)=>{
+            const el=document.createElement('div'); el.className='msg '+role; el.id='msg-'+id;
+            el.innerHTML='<div class="pending"><div class="spinner"></div><div class="pending-text">Thinking…</div></div>';
+            document.getElementById('root').appendChild(el);
+            requestAnimationFrame(()=>window.scrollToBottom());
+          };
+          window.resolvePending=(id,md)=>{
+            const el=document.getElementById('msg-'+id);
+            if(!el){ addMessage('assistant',renderMarkdown(md)); return; }
+            el.innerHTML=renderMarkdown(md);
+            requestAnimationFrame(()=>window.scrollToBottom());
+          };
+
+          // === Chunked Base64 transport (Java -> JS) ===
+          const __bigBuf={};
+          function b64ToUtf8(b64){
+            const bin=atob(b64); let s='';
+            for(let i=0;i<bin.length;i++){ s += '%' + ('00'+bin.charCodeAt(i).toString(16)).slice(-2); }
+            return decodeURIComponent(s);
+          }
+          window.startBig=(id)=>{ __bigBuf[id]=[]; };
+          window.appendBig=(id,b64part)=>{ (__bigBuf[id] ||= []).push(b64part); };
+          window.finishBig=(id)=>{
+            try{
+              const joined=(__bigBuf[id]||[]).join(''); delete __bigBuf[id];
+              const md=b64ToUtf8(joined);
+              window.resolvePending(id, md);
+            }catch(e){ console.error('finishBig error', e); }
+          };
+
+          // Copy bridge
+          const __copyBridge=%s;
+          window.__copy=(encoded)=>{ __copyBridge(encoded); };
+        </script>
+      </body>
+      </html>
+      """.formatted(copyBridgeCall);
+  }
+}
+
+
+package com.manideepr.chat;
+
+import com.intellij.openapi.project.Project;
+import com.intellij.openapi.wm.ToolWindow;
+import com.intellij.openapi.wm.ToolWindowFactory;
+import com.intellij.ui.SimpleToolWindowPanel;
+import com.intellij.ui.content.Content;
+import com.intellij.ui.content.ContentFactory;
+import com.intellij.util.Disposer;
+import org.jetbrains.annotations.NotNull;
+
+import javax.swing.*;
+import java.awt.*;
+import java.util.UUID;
+
+/**
+ * Copilot-style chat tool window using a JCEF markdown view.
+ * Shows a spinner while waiting, and uses chunked Base64 to render very large responses.
+ */
+public class ChatToolWindowFactory implements ToolWindowFactory {
+
+  // Anything larger than this will be delivered via chunked Base64 to avoid IPC limits.
+  private static final int LARGE_THRESHOLD = 8_000;
+
+  @Override
+  public void createToolWindowContent(@NotNull Project project, @NotNull ToolWindow toolWindow) {
+    // Root tool window container
+    SimpleToolWindowPanel root = new SimpleToolWindowPanel(true, true);
+
+    // Center: JCEF markdown chat view (supports spinner + large content)
+    JcefMarkdownChatView view = new JcefMarkdownChatView();
+
+    // Bottom: input row
+    ChatInputPanel input = new ChatInputPanel(text -> {
+      if (!text.isBlank()) {
+        ChatService.getInstance(project).ask(null, text);
+      }
+    });
+
+    JPanel content = new JPanel(new BorderLayout());
+    content.add(view.getComponent(), BorderLayout.CENTER);
+    content.add(input, BorderLayout.SOUTH);
+    root.setContent(content);
+
+    // Track the current "pending" spinner id (simple 1-in-flight approach)
+    final String[] pendingIdRef = new String[1];
+
+    // Wire ChatService -> UI
+    ChatService chat = ChatService.getInstance(project);
+    chat.setSink(new ChatService.Sink() {
+      @Override public void onReset() {
+        pendingIdRef[0] = null;
+        view.clear();
+      }
+
+      @Override public void onUser(String text) {
+        // Show user bubble immediately…
+        view.addUser(text);
+        // …then a spinner placeholder that will be replaced by the reply
+        String id = UUID.randomUUID().toString().replace("-", "");
+        pendingIdRef[0] = id;
+        view.addPendingAssistant(id);
+      }
+
+      @Override public void onAssistant(String text) {
+        String id = pendingIdRef[0];
+        pendingIdRef[0] = null;
+
+        if (id != null) {
+          if (isLarge(text)) {
+            view.resolvePendingLarge(id, nonNull(text));
+          } else {
+            view.resolvePending(id, nonNull(text));
+          }
+        } else {
+          // No pending spinner (e.g., UI was reset) — just append
+          if (isLarge(text)) {
+            String tmp = UUID.randomUUID().toString().replace("-", "");
+            view.addPendingAssistant(tmp);
+            view.resolvePendingLarge(tmp, nonNull(text));
+          } else {
+            view.addAssistant(nonNull(text));
+          }
+        }
+      }
+
+      @Override public void onError(String message) {
+        String id = pendingIdRef[0];
+        pendingIdRef[0] = null;
+        String md = "```text\n" + nonNull(message) + "\n```";
+
+        if (id != null) {
+          if (isLarge(md)) {
+            view.resolvePendingLarge(id, md);
+          } else {
+            view.resolvePending(id, md);
+          }
+        } else {
+          if (isLarge(md)) {
+            String tmp = UUID.randomUUID().toString().replace("-", "");
+            view.addPendingAssistant(tmp);
+            view.resolvePendingLarge(tmp, md);
+          } else {
+            view.addAssistant(md);
+          }
+        }
+      }
+
+      private boolean isLarge(String s) { return s != null && s.length() > LARGE_THRESHOLD; }
+      private String nonNull(String s) { return s == null ? "" : s; }
+    });
+
+    // Add the content tab and detach sink when disposed
+    Content tab = ContentFactory.getInstance().createContent(root, "Chat", false);
+    Disposer.register(tab, () -> ChatService.getInstance(project).setSink(null));
+    toolWindow.getContentManager().addContent(tab);
+  }
+}
+
 
