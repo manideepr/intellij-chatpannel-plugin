@@ -16,19 +16,11 @@ import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
 
-/**
- * JCEF-powered chat view with:
- * - Markdown rendering (fenced code blocks + Copy)
- * - Spinner bubbles ("pending" messages)
- * - Large message support via chunked Base64
- * - JS-console logging
- * - **Load-aware JS execution** (buffers calls until the page is ready)
- */
 public final class JcefMarkdownChatView {
   private final JBCefBrowser browser;
   private final JBCefJSQuery copyQuery;
 
-  // Page-load handling
+  // Page-load buffering
   private volatile boolean ready = false;
   private final List<String> pendingJs = new ArrayList<>();
 
@@ -36,15 +28,15 @@ public final class JcefMarkdownChatView {
     this.browser = new JBCefBrowser();
     this.copyQuery = JBCefJSQuery.create(browser);
 
-    // Bridge for "Copy" in code blocks (JS -> Java)
+    // JS -> Java Copy bridge
     copyQuery.addHandler(text -> {
-      Toolkit.getDefaultToolkit().getSystemClipboard().setContents(new StringSelection(text), null);
+      Toolkit.getDefaultToolkit().getSystemClipboard()
+          .setContents(new StringSelection(text), null);
       return null;
     });
 
+    // Console logs from JS
     JBCefClient client = browser.getJbCefClient();
-
-    // Log JS console to IDEA console (helps catch renderer errors)
     client.addDisplayHandler(new CefDisplayHandlerAdapter() {
       @Override
       public boolean onConsoleMessage(CefBrowser b, int level, String message, String source, int line) {
@@ -53,7 +45,7 @@ public final class JcefMarkdownChatView {
       }
     }, browser.getCefBrowser());
 
-    // Mark "ready" once the main frame finishes loading, then flush buffered JS calls
+    // Ready flag on load end
     client.addLoadHandler(new CefLoadHandlerAdapter() {
       @Override
       public void onLoadEnd(CefBrowser b, CefFrame frame, int httpStatusCode) {
@@ -64,8 +56,7 @@ public final class JcefMarkdownChatView {
       }
     }, browser.getCefBrowser());
 
-    // Build HTML and load it (async)
-    String injected = copyQuery.inject("atob(arguments[0])"); // decode Base64 from JS before sending to Java
+    String injected = copyQuery.inject("atob(arguments[0])"); // copy bridge expects base64->text
     browser.loadHTML(buildHtml(injected));
   }
 
@@ -81,32 +72,29 @@ public final class JcefMarkdownChatView {
     run("appendMarkdown('assistant', " + toJsString(markdown) + ");");
   }
 
-  /** Show a spinner bubble with a stable id. */
   public void addPendingAssistant(String id) {
     run("addPending('assistant', " + toJsString(id) + ");");
   }
 
-  /** Replace spinner with content (direct path for modest-size replies). */
   public void resolvePending(String id, String markdown) {
     run("resolvePending(" + toJsString(id) + ", " + toJsString(markdown) + ");");
   }
 
-  /** Replace spinner with content using chunked Base64 (for very large replies). */
+  /** Large content path: stream Base64 in chunks to JS. */
   public void resolvePendingLarge(String id, String markdown) {
     String b64 = Base64.getEncoder().encodeToString(markdown.getBytes(StandardCharsets.UTF_8));
-    int chunkSize = 8_000; // conservative to avoid IPC size limits
+    // Use a multiple of 4 to keep chunk boundaries Base64-aligned (defensive, though we rejoin before decode)
+    int chunkSize = 8192; // 8k chars, multiple of 4
     run("startBig(" + toJsString(id) + ");");
     for (int i = 0; i < b64.length(); i += chunkSize) {
       String part = b64.substring(i, Math.min(i + chunkSize, b64.length()));
-      // part is Base64; safe to embed directly
-      run("appendBig(" + toJsString(id) + ", '" + part + "');");
+      run("appendBig(" + toJsString(id) + ", '" + part + "');"); // part is pure Base64
     }
     run("finishBig(" + toJsString(id) + ");");
   }
 
   // ---------- internals ----------
 
-  /** Queue JS if page not ready; otherwise execute immediately. */
   private void run(String js) {
     if (!ready) {
       synchronized (pendingJs) { pendingJs.add(js); }
@@ -115,7 +103,6 @@ public final class JcefMarkdownChatView {
     browser.getCefBrowser().executeJavaScript(js, "about:blank", 0);
   }
 
-  /** Flush queued JS calls once the page is ready. */
   private void flushPending() {
     List<String> snapshot;
     synchronized (pendingJs) {
@@ -127,7 +114,6 @@ public final class JcefMarkdownChatView {
     }
   }
 
-  /** Escape for safe single-quoted JS string literals. */
   private static String toJsString(String s) {
     if (s == null) s = "";
     return "'" + s
@@ -141,7 +127,6 @@ public final class JcefMarkdownChatView {
         + "'";
   }
 
-  /** Build the HTML with a placeholder for the injected JS bridge (no String.format -> % safe). */
   private static String buildHtml(String copyBridgeCall) {
     String html = """
       <!doctype html>
@@ -156,11 +141,9 @@ public final class JcefMarkdownChatView {
             --code-bg:#0b1020; --code-fg:#e6edf3; --border:#d0d7de;
           }
           @media (prefers-color-scheme: dark){
-            :root {
-              --bg:#0d1117; --fg:#c9d1d9; --muted:#8b949e;
-              --bubble-user:#172b3a; --bubble-assistant:#161b22;
-              --code-bg:#0b1020; --code-fg:#e6edf3; --border:#30363d;
-            }
+            :root { --bg:#0d1117; --fg:#c9d1d9; --muted:#8b949e;
+                    --bubble-user:#172b3a; --bubble-assistant:#161b22;
+                    --code-bg:#0b1020; --code-fg:#e6edf3; --border:#30363d; }
           }
           html,body{margin:0;padding:0;background:var(--bg);color:var(--fg);
             font:13px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,"Noto Sans",sans-serif;overflow:hidden;}
@@ -184,6 +167,7 @@ public final class JcefMarkdownChatView {
           .spinner{width:16px;height:16px;border-radius:50%;border:2px solid var(--border);border-top-color:transparent;animation:spin .8s linear infinite;}
           @keyframes spin{to{transform:rotate(360deg)}}
           .pending-text{color:var(--muted);font-size:12px;}
+          .raw pre{white-space:pre-wrap;}
         </style>
       </head>
       <body>
@@ -225,7 +209,7 @@ public final class JcefMarkdownChatView {
           window.appendMarkdown=(role,md)=>addMessage(role,renderMarkdown(md));
           window.clearRoot=()=>{ document.getElementById('root').innerHTML=''; };
 
-          // Pending spinner helpers
+          // Spinner helpers
           window.addPending=(role,id)=>{
             const el=document.createElement('div'); el.className='msg '+role; el.id='msg-'+id;
             el.innerHTML='<div class="pending"><div class="spinner"></div><div class="pending-text">Thinking…</div></div>';
@@ -239,32 +223,79 @@ public final class JcefMarkdownChatView {
             requestAnimationFrame(()=>window.scrollToBottom());
           };
 
-          // === Chunked Base64 transport (Java -> JS) ===
-          const __bigBuf={};
-          function b64ToUtf8(b64){
-            const bin=atob(b64); let s='';
-            for(let i=0;i<bin.length;i++){ s += '%' + ('00'+bin.charCodeAt(i).toString(16)).slice(-2); }
-            return decodeURIComponent(s);
+          // ===== Chunked Base64 transport (Java -> JS) =====
+          const __bigBuf = {};
+          // Decode joined Base64 in safe segments aligned to 4 chars (Base64 quantum).
+          function decodeJoinedB64ToBytes(joined) {
+            const step = 16384; // chars per slice; multiple of 4; safe size for atob
+            const byteChunks = [];
+            let i = 0;
+            while (i < joined.length) {
+              let end = Math.min(i + step, joined.length);
+              // align to 4-char boundary unless it's the last slice
+              if (end < joined.length) {
+                const rem = (end - i) & 3;
+                if (rem !== 0) end -= rem;
+              }
+              const slice = joined.slice(i, end);
+              if (slice.length === 0) break;
+              const bin = atob(slice);
+              const bytes = new Uint8Array(bin.length);
+              for (let j=0; j<bin.length; j++) bytes[j] = bin.charCodeAt(j) & 0xff;
+              byteChunks.push(bytes);
+              i = end;
+            }
+            // concat
+            let total = 0;
+            for (const a of byteChunks) total += a.length;
+            const all = new Uint8Array(total);
+            let off = 0;
+            for (const a of byteChunks) { all.set(a, off); off += a.length; }
+            return all;
           }
-          window.startBig=(id)=>{ __bigBuf[id]=[]; };
-          window.appendBig=(id,b64part)=>{ (__bigBuf[id] ||= []).push(b64part); };
-          window.finishBig=(id)=>{
-            try{
-              const joined=(__bigBuf[id]||[]).join(''); delete __bigBuf[id];
-              const md=b64ToUtf8(joined);
-              window.resolvePending(id, md);
-            }catch(e){ console.error('finishBig error', e); }
+
+          window.startBig = (id) => { __bigBuf[id] = []; };
+          window.appendBig = (id, b64part) => { (__bigBuf[id] ||= []).push(b64part); };
+          window.finishBig = (id) => {
+            try {
+              const parts = __bigBuf[id] || [];
+              delete __bigBuf[id];
+              const joined = parts.join('');
+              // quick raw preview (before heavy markdown)
+              const rawHtml = '<div class="raw"><pre>' + esc((()=>{ try { return new TextDecoder("utf-8").decode(decodeJoinedB64ToBytes(joined)); } catch(e){ return "Decode failed: " + String(e); } })()) + '</pre></div>';
+              let el = document.getElementById('msg-'+id);
+              if (!el) {
+                addMessage('assistant', rawHtml);
+                // no el to upgrade; we already appended raw
+                return;
+              }
+              el.innerHTML = rawHtml;
+              requestAnimationFrame(() => {
+                try {
+                  const md = new TextDecoder('utf-8').decode(decodeJoinedB64ToBytes(joined));
+                  el.innerHTML = renderMarkdown(md);
+                } catch (e) {
+                  console.error('finishBig markdown render error', e);
+                  el.innerHTML = renderMarkdown('```text\\nRender failed: ' + String(e && e.message || e) + '\\n```');
+                }
+                requestAnimationFrame(()=>window.scrollToBottom());
+              });
+            } catch (e) {
+              console.error('finishBig error', e);
+              const el = document.getElementById('msg-'+id);
+              const msg = '```text\\nRender failed: ' + String(e && e.message || e) + '\\n```';
+              if (!el) addMessage('assistant', renderMarkdown(msg));
+              else { el.innerHTML = renderMarkdown(msg); }
+            }
           };
 
           // Copy bridge (replaced safely from Java)
           const __copyBridge = __COPY_BRIDGE__;
-          window.__copy=(encoded)=>{ __copyBridge(encoded); };
+          window.__copy = (encoded) => { __copyBridge(encoded); };
         </script>
       </body>
       </html>
       """;
-
-    // Simple placeholder replace; no String.format, so % in CSS is safe.
     return html.replace("__COPY_BRIDGE__", copyBridgeCall);
   }
 }
