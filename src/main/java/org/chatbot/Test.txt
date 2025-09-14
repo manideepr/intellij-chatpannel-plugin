@@ -1,1 +1,763 @@
 
+#!/usr/bin/env python3
+"""
+One-file RAG for Java frameworks with PGVector (ingest + search)
+
+What it does
+- Walks your repo, chunks Java (AST -> methods), .properties/.yml configs, Gradle/Maven builds
+- Extracts "recipe" chunks from example project READMEs (code fences)
+- Stores chunks + embeddings in Postgres with pgvector
+- Hybrid retrieval (vector + trigram) with simple boosting for recipes/config/examples
+- CLI with two subcommands: ingest, search
+
+Install
+  pip install javalang pyyaml psycopg2-binary pgvector numpy tiktoken lxml
+
+Optionally for OpenAI embeddings:
+  pip install openai
+  export EMBED_PROVIDER=openai
+  export OPENAI_API_KEY=...            # and optionally EMBED_MODEL=text-embedding-3-small
+
+Usage
+  # Ingest a framework repo
+  python rag_pgvector_code.py ingest \
+    --root /path/to/repo \
+    --framework data-dao --version 1.3.0 \
+    --table code_chunks --embedding-dim 1536
+
+  # Search (hybrid by default)
+  python rag_pgvector_code.py search \
+    --query "connect two datasources with hikari" \
+    --frameworks data-dao logging \
+    --table code_chunks --k 8
+
+Env (Postgres)
+  PGHOST, PGPORT, PGDATABASE, PGUSER, PGPASSWORD
+
+Notes
+- If EMBED_PROVIDER is unset or "none", embeddings will be zero vectors (lexical still works).
+- Make sure `CREATE EXTENSION vector;` and `CREATE EXTENSION pg_trgm;` are available on your DB.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import os
+import re
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Tuple
+
+import numpy as np
+import psycopg2
+from psycopg2.extras import execute_values, Json
+from pgvector.psycopg2 import register_vector
+
+# Optional deps
+try:
+    import javalang  # type: ignore
+except Exception:
+    javalang = None
+
+try:
+    import yaml  # type: ignore
+except Exception:
+    yaml = None
+
+try:
+    import tiktoken  # type: ignore
+except Exception:
+    tiktoken = None
+
+# -------------------------------
+# Constants & helpers
+# -------------------------------
+
+JAVA_EXTS = {".java"}
+CONFIG_PROPS_EXTS = {".properties"}
+CONFIG_YAML_EXTS = {".yml", ".yaml"}
+BUILD_GRADLE = {"build.gradle", "build.gradle.kts"}
+POM_FILES = {"pom.xml"}
+
+DEFAULT_MAX_TOKENS = 600
+DEFAULT_HARD_CAP = 800
+
+HEADER_TEMPLATE = (
+    "[Framework: {framework}]\n"
+    "[Version: {version}]\n"
+    "[Package: {package}]\n"
+    "[Class: {class_name}]\n"
+    "[Method: {method_name}]\n"
+    "[Signature: {signature}]\n"
+    "[Imports: {imports}]\n"
+)
+
+@dataclass
+class Chunk:
+    framework: str
+    version: str
+    language: str
+    file_path: str
+    package: Optional[str]
+    class_name: Optional[str]
+    symbol_kind: str  # method|config|build|recipe|doc
+    method_name: Optional[str]
+    signature: Optional[str]
+    imports: List[str]
+    is_recipe: bool
+    is_config: bool
+    is_example: bool
+    start_line: Optional[int]
+    end_line: Optional[int]
+    tokens: int
+    content: str
+    raw_code: Optional[str]
+    meta: Dict
+    hash_key: str
+
+def build_tokenizer():
+    if tiktoken is not None:
+        try:
+            enc = tiktoken.get_encoding("cl100k_base")
+            return lambda s: len(enc.encode(s))
+        except Exception:
+            pass
+    return lambda s: max(1, len(re.findall(r"\w+|\S", s)))
+
+TOK_COUNT = build_tokenizer()
+
+def _read_text(path: Path) -> str:
+    return path.read_text(encoding="utf-8", errors="ignore")
+
+# -------------------------------
+# Java parsing & chunking
+# -------------------------------
+
+def _extract_javadoc_above(lines: List[str], from_line_1_based: int) -> str:
+    i = from_line_1_based - 2
+    while i >= 0 and lines[i].strip() == "":
+        i -= 1
+    if i < 0:
+        return ""
+    if "*/" in lines[i]:
+        end = i
+        while i >= 0:
+            if "/**" in lines[i]:
+                start = i
+                return "\n".join(lines[start:end+1])
+            i -= 1
+    return ""
+
+def _find_block_span(lines: List[str], start_line_1: int) -> Tuple[int, int]:
+    start_idx = start_line_1 - 1
+    text_from = "\n".join(lines[start_idx:])
+    brace_pos = text_from.find("{")
+    if brace_pos == -1:
+        return start_line_1, start_line_1
+    depth = 0
+    i = 0
+    for ch in text_from[brace_pos:]:
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                break
+        i += 1
+    end_line = start_line_1 + (text_from[: brace_pos + i].count("\n"))
+    return start_line_1, max(start_line_1, end_line)
+
+def _format_signature(md) -> str:
+    try:
+        rt = getattr(md, 'return_type', None)
+        rt_str = getattr(rt, 'name', None) if rt else ('void' if getattr(md, 'constructor', False) else 'void')
+        params = []
+        for p in getattr(md, 'parameters', []) or []:
+            ptype = getattr(p.type, 'name', str(p.type))
+            pname = getattr(p, 'name', 'arg')
+            dims = '[]' * getattr(p, 'dimensions', 0)
+            params.append(f"{ptype}{dims} {pname}")
+        name = getattr(md, 'name', '<init>')
+        mods = ' '.join(sorted(getattr(md, 'modifiers', []) or []))
+        return f"{mods} {rt_str} {name}({', '.join(params)})".strip()
+    except Exception:
+        return str(md)
+
+METHOD_DECL_RE = re.compile(r"^(\s*(public|private|protected|static|final|synchronized|abstract)\s+)*\s*[\w\<\>\[\]]+\s+[\w]+\s*\([^\)]*\)\s*\{", re.M)
+
+def _java_ast_chunks(path: Path, framework: str, version: str) -> List[Chunk]:
+    src = _read_text(path)
+    lines = src.splitlines()
+    chunks: List[Chunk] = []
+    if javalang is None:
+        return chunks
+    try:
+        tree = javalang.parse.parse(src)
+    except Exception:
+        return chunks
+
+    pkg = getattr(getattr(tree, 'package', None), 'name', None)
+    imports = [imp.path for imp in getattr(tree, 'imports', [])]
+
+    for type_decl in getattr(tree, 'types', []) or []:
+        class_name = getattr(type_decl, 'name', None)
+        for md in getattr(type_decl, 'methods', []) or []:
+            pos = getattr(md, 'position', None)
+            line = pos.line if pos else 1
+            jdoc = _extract_javadoc_above(lines, line)
+            signature = _format_signature(md)
+            method_name = getattr(md, 'name', None)
+            s_line, e_line = _find_block_span(lines, line)
+            raw_code = "\n".join(lines[s_line - 1:e_line])
+            header = HEADER_TEMPLATE.format(
+                framework=framework, version=version,
+                package=pkg or "", class_name=class_name or "",
+                method_name=method_name or "", signature=signature,
+                imports=", ".join(imports[:24])
+            )
+            content = "\n".join([header] + ([jdoc] if jdoc else []) + [raw_code])
+            tokens = TOK_COUNT(content)
+
+            if tokens > DEFAULT_HARD_CAP:
+                blocks = re.split(r"\n\s*\n+", raw_code)
+                current: List[str] = []
+                assembled: List[str] = []
+                for b in blocks:
+                    cand = "\n".join(current + [b])
+                    cand_content = "\n".join([header] + ([jdoc] if jdoc else []) + [cand])
+                    if TOK_COUNT(cand_content) > DEFAULT_MAX_TOKENS and current:
+                        assembled.append("\n\n".join(current))
+                        # tiny overlap
+                        current = current[-1:] + [b]
+                    else:
+                        current.append(b)
+                if current: assembled.append("\n\n".join(current))
+                for part in assembled:
+                    part_content = "\n".join([header] + ([jdoc] if jdoc else []) + [part])
+                    chunks.append(_make_chunk(
+                        framework, version, "java", str(path),
+                        pkg, class_name, "method",
+                        method_name, signature, imports,
+                        False, False, False, s_line, e_line,
+                        part_content, part,
+                        meta={}
+                    ))
+            else:
+                chunks.append(_make_chunk(
+                    framework, version, "java", str(path),
+                    pkg, class_name, "method",
+                    method_name, signature, imports,
+                    False, False, False, s_line, e_line,
+                    content, raw_code,
+                    meta={}
+                ))
+    return chunks
+
+def _java_fallback_chunks(path: Path, framework: str, version: str) -> List[Chunk]:
+    src = _read_text(path)
+    lines = src.splitlines()
+    chunks: List[Chunk] = []
+    pkg_m = re.search(r"^\s*package\s+([\w\.]+)\s*;", src, re.M)
+    pkg = pkg_m.group(1) if pkg_m else None
+    imports = re.findall(r"^\s*import\s+([\w\.\*]+)\s*;", src, re.M)
+    cls_m = re.search(r"\b(class|interface|enum)\s+(\w+)", src)
+    class_name = cls_m.group(2) if cls_m else None
+
+    for m in METHOD_DECL_RE.finditer(src):
+        start = m.start()
+        start_line = src.count("\n", 0, start) + 1
+        s_line, e_line = _find_block_span(lines, start_line)
+        raw_code = "\n".join(lines[s_line - 1:e_line])
+        header = HEADER_TEMPLATE.format(
+            framework=framework, version=version,
+            package=pkg or "", class_name=class_name or "",
+            method_name="", signature="(fallback)",
+            imports=", ".join(imports[:24])
+        )
+        content = header + "\n" + raw_code
+        chunks.append(_make_chunk(
+            framework, version, "java", str(path),
+            pkg, class_name, "method",
+            None, None, imports,
+            False, False, False, s_line, e_line,
+            content, raw_code, meta={}
+        ))
+    return chunks
+
+# -------------------------------
+# Config / build chunkers
+# -------------------------------
+
+def _flatten_yaml(d: Dict, prefix: str = "") -> List[Tuple[str, str]]:
+    pairs: List[Tuple[str, str]] = []
+    if isinstance(d, dict):
+        for k, v in d.items():
+            key = f"{prefix}{k}" if not prefix else f"{prefix}.{k}"
+            pairs.extend(_flatten_yaml(v, key))
+    elif isinstance(d, list):
+        for i, v in enumerate(d):
+            key = f"{prefix}[{i}]"
+            pairs.extend(_flatten_yaml(v, key))
+    else:
+        pairs.append((prefix, str(d)))
+    return pairs
+
+def _chunk_properties(path: Path, framework: str, version: str, batch: int = 6) -> List[Chunk]:
+    lines = _read_text(path).splitlines()
+    kvs: List[Tuple[str, str]] = []
+    for ln in lines:
+        ln = ln.strip()
+        if not ln or ln.startswith("#"):
+            continue
+        if "=" in ln:
+            k, v = ln.split("=", 1); kvs.append((k.strip(), v.strip()))
+        elif ":" in ln:
+            k, v = ln.split(":", 1); kvs.append((k.strip(), v.strip()))
+    chunks: List[Chunk] = []
+    for i in range(0, len(kvs), batch):
+        group = kvs[i:i+batch]
+        body = "\n".join(f"{k}={v}" for k, v in group)
+        header = f"[Framework: {framework}]\n[Version: {version}]\n[Config File: {path.name}]\n[Path: {path}]\n"
+        content = header + "\n" + body
+        chunks.append(_make_chunk(
+            framework, version, "properties", str(path),
+            None, None, "config", None, None, [],
+            False, True, False, None, None,
+            content, body, meta={"config_keys":[k for k,_ in group]}
+        ))
+    return chunks
+
+def _chunk_yaml(path: Path, framework: str, version: str, batch: int = 8) -> List[Chunk]:
+    if yaml is None:
+        return []
+    try:
+        data = yaml.safe_load(_read_text(path))
+    except Exception:
+        return []
+    pairs = _flatten_yaml(data) if isinstance(data, (dict, list)) else []
+    chunks: List[Chunk] = []
+    for i in range(0, len(pairs), batch):
+        group = pairs[i:i+batch]
+        lines = [f"{k}: {v}" for k, v in group]
+        body = "\n".join(lines)
+        header = f"[Framework: {framework}]\n[Version: {version}]\n[Config File: {path.name}]\n[Path: {path}]\n"
+        content = header + "\n" + body
+        chunks.append(_make_chunk(
+            framework, version, "yaml", str(path),
+            None, None, "config", None, None, [],
+            False, True, False, None, None,
+            content, body, meta={"config_keys":[k for k,_ in group]}
+        ))
+    return chunks
+
+def _chunk_gradle(path: Path, framework: str, version: str) -> List[Chunk]:
+    text = _read_text(path)
+    deps = []
+    for line in text.splitlines():
+        if re.search(r"\b(implementation|api|compileOnly|runtimeOnly)\b\s*\(\"", line):
+            deps.append(line.strip())
+    if not deps:
+        return []
+    body = "\n".join(deps)
+    header = f"[Framework: {framework}]\n[Version: {version}]\n[Build File: {path.name}]\n[Path: {path}]\n"
+    content = header + "\n" + body
+    return [ _make_chunk(
+        framework, version, "gradle", str(path),
+        None, None, "build", None, None, [],
+        False, False, False, None, None,
+        content, body, meta={"artifacts_guess": deps[:5]}
+    ) ]
+
+def _chunk_pom(path: Path, framework: str, version: str) -> List[Chunk]:
+    try:
+        from lxml import etree
+        xml = etree.fromstring(_read_text(path).encode("utf-8"))
+        deps = xml.xpath("//dependency")
+        lines = []
+        for d in deps:
+            g = d.findtext("groupId") or ""
+            a = d.findtext("artifactId") or ""
+            v = d.findtext("version") or ""
+            scope = d.findtext("scope") or ""
+            lines.append(f"{g}:{a}:{v} {('['+scope+']') if scope else ''}")
+        if not lines:
+            return []
+        body = "\n".join(lines)
+    except Exception:
+        return []
+    header = f"[Framework: {framework}]\n[Version: {version}]\n[Build File: {path.name}]\n[Path: {path}]\n"
+    content = header + "\n" + body
+    return [ _make_chunk(
+        framework, version, "maven", str(path),
+        None, None, "build", None, None, [],
+        False, False, False, None, None,
+        content, body, meta={"artifacts": lines}
+    ) ]
+
+# -------------------------------
+# Example README -> recipe chunks
+# -------------------------------
+
+HEAD_RE = re.compile(r"^#{1,4}\s+(.*)$", re.M)
+FENCE_RE = re.compile(r"```(\w+)?\n(.*?)\n```", re.S)
+
+def _build_recipe_chunks_from_readme(readme: Path, framework: str, version: str, example_name: str) -> List[Chunk]:
+    text = _read_text(readme)
+    sections = [(m.group(1).strip(), m.start()) for m in HEAD_RE.finditer(text)]
+    if not sections:
+        sections = [("Instructions", 0)]
+    sections.append(("__END__", len(text)))
+    spans = [(sections[i][0], text[sections[i][1]:sections[i+1][1]]) for i in range(len(sections)-1)]
+
+    out: List[Chunk] = []
+    for title, body in spans:
+        if title == "__END__": continue
+        fences = FENCE_RE.findall(body)
+        code_bits, cmds, artifacts, cfg_keys = [], [], [], []
+        for lang, code in fences:
+            lang = (lang or "").lower()
+            if lang in {"java","kotlin","kt"}: code_bits.append(code.strip())
+            elif lang in {"yaml","yml","properties"}:
+                code_bits.append(code.strip())
+                cfg_keys += re.findall(r"^[a-zA-Z0-9_.-]+\s*[:=]", code, re.M)
+            elif lang in {"bash","sh"}: cmds += [l.strip() for l in code.splitlines() if l.strip()]
+            elif lang in {"xml","gradle","groovy","kts"}: artifacts.append(code.strip())
+
+        if not code_bits and not cmds and not artifacts:
+            continue
+
+        header = (
+            f"[Recipe: {title}]\n"
+            f"[Example: {example_name}]\n"
+            f"[Frameworks: {framework}]\n"
+            f"[Run: {cmds[0] if cmds else ''}]\n"
+            f"[ConfigKeys: {', '.join(k.split(':')[0].split('=')[0] for k in cfg_keys[:6])}]\n"
+        )
+        body_min = "\n\n".join(code_bits[:3])
+        content = header + "\n" + body_min
+        meta = {
+            "example_name": example_name,
+            "commands": cmds[:5],
+            "artifacts": artifacts[:5],
+            "config_keys": [k.split(':')[0].split('=')[0] for k in cfg_keys[:10]],
+            "readme_path": str(readme),
+            "recipe_title": title,
+        }
+        out.append(_make_chunk(
+            framework, version, "markdown", str(readme),
+            None, None, "recipe", None, None, [],
+            True, False, True, None, None,
+            content, body_min, meta=meta
+        ))
+    return out
+
+def _find_example_readmes(root: Path) -> List[Path]:
+    cands = []
+    for p in root.rglob("README.md"):
+        parent = p.parent.name.lower()
+        if parent in {"examples","example","samples","sample"} or "example" in parent or "sample" in parent:
+            cands.append(p)
+    if not cands:
+        cands = list(root.rglob("README.md"))
+    return cands
+
+# -------------------------------
+# Chunk factory
+# -------------------------------
+
+def _make_chunk(
+    framework: str, version: str, language: str, file_path: str,
+    package: Optional[str], class_name: Optional[str], symbol_kind: str,
+    method_name: Optional[str], signature: Optional[str], imports: List[str],
+    is_recipe: bool, is_config: bool, is_example: bool,
+    start_line: Optional[int], end_line: Optional[int],
+    content: str, raw_code: Optional[str], meta: Dict
+) -> Chunk:
+    tokens = TOK_COUNT(content)
+    hash_src = f"{framework}|{version}|{file_path}|{start_line}|{end_line}|{hashlib.sha1(content.encode()).hexdigest()}"
+    return Chunk(
+        framework=framework, version=version, language=language,
+        file_path=file_path, package=package, class_name=class_name,
+        symbol_kind=symbol_kind, method_name=method_name, signature=signature,
+        imports=imports, is_recipe=is_recipe, is_config=is_config, is_example=is_example,
+        start_line=start_line, end_line=end_line, tokens=tokens,
+        content=content, raw_code=raw_code, meta=meta, hash_key=hash_src
+    )
+
+# -------------------------------
+# Embeddings
+# -------------------------------
+
+def get_embedder(embedding_dim: int):
+    provider = os.getenv("EMBED_PROVIDER", "none").lower()
+    if provider == "openai":
+        try:
+            from openai import OpenAI  # type: ignore
+        except Exception:
+            raise RuntimeError("Install openai>=1.0.0 for OPENAI provider")
+        model = os.getenv("EMBED_MODEL", "text-embedding-3-small")
+        client = OpenAI()
+        def embed(text: str) -> np.ndarray:
+            if len(text) > 200_000:  # safety
+                text = text[:200_000]
+            out = client.embeddings.create(model=model, input=text)
+            vec = np.array(out.data[0].embedding, dtype=np.float32)
+            if vec.shape[0] != embedding_dim:
+                raise RuntimeError(f"Embedding dim {vec.shape[0]} != table dim {embedding_dim}")
+            return vec
+        return embed
+    elif provider == "none":
+        def embed(_text: str) -> np.ndarray:
+            return np.zeros((embedding_dim,), dtype=np.float32)
+        return embed
+    else:
+        raise RuntimeError(f"Unsupported EMBED_PROVIDER={provider}")
+
+# -------------------------------
+# Postgres schema & IO
+# -------------------------------
+
+DDL = """
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+CREATE TABLE IF NOT EXISTS {table} (
+  id           BIGSERIAL PRIMARY KEY,
+  framework    TEXT NOT NULL,
+  version      TEXT,
+  language     TEXT NOT NULL,
+  file_path    TEXT,
+  package      TEXT,
+  class_name   TEXT,
+  symbol_kind  TEXT,
+  method_name  TEXT,
+  signature    TEXT,
+  imports      TEXT[],
+  is_recipe    BOOLEAN DEFAULT FALSE,
+  is_config    BOOLEAN DEFAULT FALSE,
+  is_example   BOOLEAN DEFAULT FALSE,
+  start_line   INT,
+  end_line     INT,
+  tokens       INT,
+  content      TEXT NOT NULL,
+  raw_code     TEXT,
+  metadata     JSONB,
+  embedding    VECTOR({dim}),
+  hash_key     TEXT UNIQUE
+);
+CREATE INDEX IF NOT EXISTS {table}_embedding_hnsw
+  ON {table} USING hnsw (embedding vector_cosine_ops);
+CREATE INDEX IF NOT EXISTS {table}_content_trgm
+  ON {table} USING gin (content gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS {table}_framework ON {table}(framework);
+CREATE INDEX IF NOT EXISTS {table}_symbol_kind ON {table}(symbol_kind);
+"""
+
+INSERT_SQL = """
+INSERT INTO {table}
+  (framework, version, language, file_path, package, class_name, symbol_kind,
+   method_name, signature, imports, is_recipe, is_config, is_example,
+   start_line, end_line, tokens, content, raw_code, metadata, embedding, hash_key)
+VALUES %s
+ON CONFLICT (hash_key) DO NOTHING
+"""
+
+def _connect():
+    conn = psycopg2.connect(
+        host=os.getenv("PGHOST", "localhost"),
+        port=int(os.getenv("PGPORT", "5432")),
+        dbname=os.getenv("PGDATABASE"),
+        user=os.getenv("PGUSER"),
+        password=os.getenv("PGPASSWORD"),
+    )
+    register_vector(conn)
+    return conn
+
+# -------------------------------
+# Build all chunks
+# -------------------------------
+
+def build_chunks(root: Path, framework: str, version: str, include_examples: bool = True) -> List[Chunk]:
+    chunks: List[Chunk] = []
+    for path in root.rglob("*"):
+        if path.is_dir():
+            continue
+        ext = path.suffix.lower()
+        name = path.name
+        try:
+            if ext in JAVA_EXTS:
+                ast_chunks = _java_ast_chunks(path, framework, version)
+                chunks.extend(ast_chunks if ast_chunks else _java_fallback_chunks(path, framework, version))
+            elif ext in CONFIG_PROPS_EXTS:
+                chunks.extend(_chunk_properties(path, framework, version))
+            elif ext in CONFIG_YAML_EXTS:
+                chunks.extend(_chunk_yaml(path, framework, version))
+            elif name in BUILD_GRADLE:
+                chunks.extend(_chunk_gradle(path, framework, version))
+            elif name in POM_FILES:
+                chunks.extend(_chunk_pom(path, framework, version))
+            elif name.lower() in {"readme.md"} and include_examples:
+                pass
+        except Exception as e:
+            print(f"[WARN] Failed to process {path}: {e}", file=sys.stderr)
+
+    if include_examples:
+        for readme in _find_example_readmes(root):
+            example_name = readme.parent.name
+            chunks.extend(_build_recipe_chunks_from_readme(readme, framework, version, example_name))
+    return chunks
+
+# -------------------------------
+# Ingest
+# -------------------------------
+
+def ingest(root: Path, framework: str, version: str, table: str, embedding_dim: int):
+    conn = _connect()
+    with conn.cursor() as cur:
+        cur.execute(DDL.format(table=table, dim=embedding_dim))
+    conn.commit()
+
+    embed = get_embedder(embedding_dim)
+    all_chunks = build_chunks(root, framework, version, include_examples=True)
+    print(f"Built {len(all_chunks)} chunks", file=sys.stderr)
+
+    batch = 200
+    idx = 0
+    with conn.cursor() as cur:
+        while idx < len(all_chunks):
+            part = all_chunks[idx: idx+batch]
+            rows = []
+            for c in part:
+                vec = embed(c.content).tolist()
+                rows.append((
+                    c.framework, c.version, c.language, c.file_path, c.package, c.class_name,
+                    c.symbol_kind, c.method_name, c.signature, c.imports, c.is_recipe, c.is_config,
+                    c.is_example, c.start_line, c.end_line, c.tokens, c.content, c.raw_code,
+                    Json(c.meta), vec, c.hash_key
+                ))
+            execute_values(cur, INSERT_SQL.format(table=table), rows, page_size=batch)
+            conn.commit()
+            idx += batch
+            print(f"Inserted {min(idx, len(all_chunks))}/{len(all_chunks)}", file=sys.stderr)
+    conn.close()
+    print("Ingest complete.", file=sys.stderr)
+
+# -------------------------------
+# Search
+# -------------------------------
+
+HYBRID_SQL = """
+WITH vec AS (
+  SELECT id, 1 - (embedding <=> %s) AS vscore
+  FROM {table}
+  WHERE (%s::text[] IS NULL OR framework = ANY(%s))
+  ORDER BY embedding <=> %s
+  LIMIT 200
+),
+lex AS (
+  SELECT id, GREATEST(similarity(content, %s), 0) AS lscore
+  FROM {table}
+  WHERE (%s::text[] IS NULL OR framework = ANY(%s))
+    AND content % %s
+  ORDER BY lscore DESC
+  LIMIT 200
+),
+unioned AS (
+  SELECT id, vscore, 0::float AS lscore FROM vec
+  UNION ALL
+  SELECT id, 0::float, lscore FROM lex
+),
+agg AS (
+  SELECT id,
+         MAX(vscore) AS vscore,
+         MAX(lscore) AS lscore,
+         (0.7*MAX(vscore) + 0.3*MAX(lscore)
+          + 0.10*MAX(CASE WHEN is_example THEN 1 ELSE 0 END)
+          + 0.10*MAX(CASE WHEN is_recipe THEN 1 ELSE 0 END)
+          + 0.08*MAX(CASE WHEN is_config THEN 1 ELSE 0 END)) AS fused
+  FROM unioned
+  JOIN {table} USING (id)
+  GROUP BY id
+)
+SELECT c.id, c.framework, c.file_path, c.class_name, c.method_name, c.signature,
+       c.symbol_kind, c.is_recipe, c.is_config, c.is_example,
+       a.vscore, a.lscore, a.fused, c.content
+FROM agg a
+JOIN {table} c USING (id)
+ORDER BY a.fused DESC
+LIMIT %s;
+"""
+
+VEC_ONLY_SQL = """
+SELECT id, framework, file_path, class_name, method_name, signature, symbol_kind,
+       is_recipe, is_config, is_example,
+       1 - (embedding <=> %s) AS vscore,
+       content
+FROM {table}
+WHERE (%s::text[] IS NULL OR framework = ANY(%s))
+ORDER BY embedding <=> %s
+LIMIT %s;
+"""
+
+def _embed_query_vector(embedding_dim: int, text: str) -> List[float]:
+    embed = get_embedder(embedding_dim)
+    return embed(text).tolist()
+
+def search(table: str, query: str, frameworks: Optional[List[str]], k: int, embedding_dim: int, hybrid: bool = True):
+    conn = _connect()
+    emb = _embed_query_vector(embedding_dim, query)
+    with conn.cursor() as cur:
+        if hybrid:
+            cur.execute(HYBRID_SQL.format(table=table),
+                        (emb, frameworks, frameworks, emb, query, frameworks, frameworks, query, k))
+        else:
+            cur.execute(VEC_ONLY_SQL.format(table=table),
+                        (emb, frameworks, frameworks, emb, k))
+        rows = cur.fetchall()
+    conn.close()
+    return rows
+
+# -------------------------------
+# CLI
+# -------------------------------
+
+def main():
+    ap = argparse.ArgumentParser(description="RAG for Java frameworks with PGVector (ingest + search)")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    ap_ing = sub.add_parser("ingest", help="Chunk repo and ingest into PGVector")
+    ap_ing.add_argument("--root", required=True)
+    ap_ing.add_argument("--framework", required=True)
+    ap_ing.add_argument("--version", default="0.0.0")
+    ap_ing.add_argument("--table", default="code_chunks")
+    ap_ing.add_argument("--embedding-dim", type=int, default=int(os.getenv("EMBEDDING_DIM", "1536")))
+
+    ap_s = sub.add_parser("search", help="Query the stored chunks")
+    ap_s.add_argument("--table", default="code_chunks")
+    ap_s.add_argument("--query", required=True)
+    ap_s.add_argument("--frameworks", nargs="*", default=None, help="e.g. data-dao logging")
+    ap_s.add_argument("--k", type=int, default=8)
+    ap_s.add_argument("--embedding-dim", type=int, default=int(os.getenv("EMBEDDING_DIM", "1536")))
+    ap_s.add_argument("--vec-only", action="store_true", help="Disable trigram hybrid and use vector only")
+
+    args = ap.parse_args()
+
+    if args.cmd == "ingest":
+        root = Path(args.root).expanduser().resolve()
+        if not root.exists():
+            print(f"Root not found: {root}", file=sys.stderr)
+            sys.exit(2)
+        ingest(root, args.framework, args.version, args.table, args.embedding_dim)
+
+    elif args.cmd == "search":
+        rows = search(args.table, args.query, args.frameworks, args.k, args.embedding_dim, hybrid=not args.vec_only)
+        for r in rows:
+            if len(r) == 13:  # hybrid
+                (_id, fw, path, cls, mname, sig, kind, is_rec, is_cfg, is_ex, v, l, f, content) = r
+                print(f"[{fw}] {kind} | {path} | {cls}.{mname or ''} | score={f:.3f}")
+            else:
+                (_id, fw, path, cls, mname, sig, kind, is_rec, is_cfg, is_ex, v, content) = r
+                print(f"[{fw}] {kind} | {path} | {cls}.{mname or ''} | vscore={v:.3f}")
+
+if __name__ == "__main__":
+    main()
