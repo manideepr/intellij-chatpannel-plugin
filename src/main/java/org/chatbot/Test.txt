@@ -1,862 +1,412 @@
 #!/usr/bin/env python3
 """
-Two-table RAG with PGVector (collections + chunks) + Auto-Routed Retrieval
+Parse a `git log -p` file and produce:
+  1) Upgrade Edge chunks: each dependency bump (from_version -> to_version)
+  2) Version Ledger chunks: per artifact, observed versions and latest
 
-Features
-- Tables: kb_collections (registry), kb_chunks (vectors) with FK collection_id
-- Ingest a single collection OR every child dir under a parent root (each child = one collection)
-- AST/fallback Java chunking + config/build chunkers + README→recipe extraction
-- Hybrid retrieval (vector + trigram) with boosts (recipes/config/examples)
-- Auto-routing: discover top-N relevant collections for a query, then retrieve within them
-- Optional query expansion via synonyms file (yaml/json)
-
-Install
-  pip install javalang pyyaml psycopg2-binary pgvector numpy tiktoken lxml
-
-Optional (OpenAI embeddings)
-  pip install openai
-  export EMBED_PROVIDER=openai
-  export OPENAI_API_KEY=...
-  # optional: EMBED_MODEL=text-embedding-3-small (1536) or *-large (3072)
-
-Postgres env
-  PGHOST, PGPORT, PGDATABASE, PGUSER, PGPASSWORD
-
-Usage
-  # Ingest ONE collection
-  python rag_pgvector_kb_autoroute.py ingest \
-    --root /path/to/repo \
-    --collection code --kb-type code --version 1.3.0 \
-    --embedding-dim 1536
-
-  # Ingest every child dir under a parent; each child becomes a collection
-  python rag_pgvector_kb_autoroute.py ingest-parent \
-    --parent-root /path/to/frameworks \
-    --kb-type code --embedding-dim 1536 \
-    --name-prefix fw- \
-    --name-map /path/to/collections_map.yaml   # optional
-
-  # Auto-search (no framework passed). It will pick top collections itself.
-  python rag_pgvector_kb_autoroute.py search-auto \
-    --query "I want to set up a DynamoDB table" \
-    --k 8 --top-collections 5 \
-    --embedding-dim 1536 \
-    --synonyms /path/to/synonyms.yaml          # optional
+Outputs JSONL by default; optionally inserts into Postgres (pgvector schema).
 """
+
 from __future__ import annotations
-
-import argparse
-import hashlib
-import json
-import os
-import re
-import sys
-from dataclasses import dataclass
+import argparse, json, os, re, sys
+from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import List, Dict, Tuple, Optional, Iterable
 
-import numpy as np
-import psycopg2
-from psycopg2.extras import execute_values, Json
-from pgvector.psycopg2 import register_vector
+# ----------------- Patterns -----------------
+BUILD_FILES = {"pom.xml", "build.gradle", "build.gradle.kts"}
+GR_COORD_RE = re.compile(r'["\']([A-Za-z0-9_.\-]+:[A-Za-z0-9_.\-]+):([A-Za-z0-9+_.\-]+)["\']')
+POM_G_RE = re.compile(r"<groupId>\s*([^<]+)\s*</groupId>", re.I)
+POM_A_RE = re.compile(r"<artifactId>\s*([^<]+)\s*</artifactId>", re.I)
+POM_V_RE = re.compile(r"<version>\s*([^<]+)\s*</version>", re.I)
 
-# Optional deps
-try:
-    import javalang  # type: ignore
-except Exception:
-    javalang = None
-try:
-    import yaml  # type: ignore
-except Exception:
-    yaml = None
-try:
-    import tiktoken  # type: ignore
-except Exception:
-    tiktoken = None
+COMMIT_LINE = re.compile(r"^commit\s+([0-9a-f]{7,40})\b", re.I)
+AUTHOR_LINE = re.compile(r"^Author:\s*(.+)$", re.I)
+DATE_LINE   = re.compile(r"^Date:\s*(.+)$", re.I)
+DIFF_START  = re.compile(r"^diff --git a/(.+?) b/(.+)$")
+HUNK_START  = re.compile(r"^@@ ")
+ANSI        = re.compile(r"\x1b\[[0-9;]*m")  # strip ANSI if present
 
-# -------------------------------
-# Constants & helpers
-# -------------------------------
-JAVA_EXTS = {".java"}
-CONFIG_PROPS_EXTS = {".properties"}
-CONFIG_YAML_EXTS = {".yml", ".yaml"}
-BUILD_GRADLE = {"build.gradle", "build.gradle.kts"}
-POM_FILES = {"pom.xml"}
+SEMVER = re.compile(r"^(\d+)\.(\d+)\.(\d+)(?:[+.-].*)?$")
 
-DEFAULT_MAX_TOKENS = 600
-DEFAULT_HARD_CAP = 800
+def semver_key(v: str) -> tuple[int,int,int,int]:
+    """Sort key: semantic triplet, then a stable tiebreaker by length to push pure semver above qualifiers."""
+    m = SEMVER.match(v or "")
+    if not m:
+        return (0,0,0,-len(v))
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3)), 0)
 
-HEADER_TEMPLATE = (
-    "[Collection: {collection}]\n"
-    "[Version: {version}]\n"
-    "[Package: {package}]\n"
-    "[Class: {class_name}]\n"
-    "[Method: {method_name}]\n"
-    "[Signature: {signature}]\n"
-    "[Imports: {imports}]\n"
-)
+def semver_delta(a: str, b: str) -> str:
+    ma, mb = SEMVER.match(a or ""), SEMVER.match(b or "")
+    if not (ma and mb): return "other"
+    A = (int(ma.group(1)), int(ma.group(2)), int(ma.group(3)))
+    B = (int(mb.group(1)), int(mb.group(2)), int(mb.group(3)))
+    if A[0] != B[0]: return "major"
+    if A[1] != B[1]: return "minor"
+    if A[2] != B[2]: return "patch"
+    return "other"
 
-IGNORE_DIRS = {".git", ".idea", ".vscode", "target", "build", "out", "node_modules"}
+def first_segment_after(path: str, base_prefix: str) -> str:
+    path = path.lstrip("/")
+    if base_prefix and base_prefix in path:
+        _, after = path.split(base_prefix, 1)
+        after = after.lstrip("/")
+        return after.split("/", 1)[0] if after else base_prefix.strip("/").split("/")[-1]
+    return path.split("/", 1)[0] if "/" in path else path
+
+# ----------------- Data -----------------
+@dataclass
+class UpgradeEdge:
+    framework_folder: str
+    commit: str
+    author: str
+    date: str
+    file: str
+    group: str
+    artifact: str
+    from_version: str
+    to_version: str
+    semver_delta: str
+    content: str           # small header + compact diff snippet
+    tags: List[str]
+    keywords: List[str]
+    symbol_kind: str = "upgrade"
+    is_recipe: bool = True
+    is_config: bool = False
+    is_example: bool = False
 
 @dataclass
-class Chunk:
-    external_id: str
-    language: str
-    symbol_kind: str  # method|config|build|recipe|doc
-    is_recipe: bool
-    is_config: bool
-    is_example: bool
-    package: Optional[str]
-    class_name: Optional[str]
-    method_name: Optional[str]
-    signature: Optional[str]
-    start_line: Optional[int]
-    end_line: Optional[int]
-    tokens: int
-    content: str
-    raw_code: Optional[str]
-    meta: Dict
-    hash_key: str
+class VersionLedger:
+    framework_folder: str
+    group: str
+    artifact: str
+    versions: List[str]    # sorted ascending
+    latest: str
+    latest_date: Optional[str]
+    content: str           # small human-readable ledger
+    tags: List[str]
+    keywords: List[str]
+    symbol_kind: str = "version_ledger"
+    is_recipe: bool = False
+    is_config: bool = False
+    is_example: bool = False
 
-def build_tokenizer():
-    if tiktoken is not None:
-        try:
-            enc = tiktoken.get_encoding("cl100k_base")
-            return lambda s: len(enc.encode(s))
-        except Exception:
-            pass
-    return lambda s: max(1, len(re.findall(r"\w+|\S", s)))
+# ----------------- Parse git log -p file -----------------
+def parse_gitlog(file_path: Path) -> List[dict]:
+    """
+    Return a list of commits:
+      {hash, author, date, diffs: [{a, b, lines: [...] }]}
+    """
+    txt = ANSI.sub("", file_path.read_text(encoding="utf-8", errors="ignore"))
+    lines = txt.splitlines()
 
-TOK_COUNT = build_tokenizer()
+    commits: List[dict] = []
+    cur: Optional[dict] = None
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        m = COMMIT_LINE.match(line)
+        if m:
+            if cur:
+                commits.append(cur)
+            cur = {"hash": m.group(1), "author": "", "date": "", "diffs": []}
+            i += 1
+            # header
+            while i < len(lines):
+                l = lines[i]
+                if DIFF_START.match(l) or l.strip() == "":
+                    break
+                am = AUTHOR_LINE.match(l)
+                dm = DATE_LINE.match(l)
+                if am: cur["author"] = am.group(1).strip()
+                if dm: cur["date"]   = dm.group(1).strip()
+                i += 1
+            continue
 
-def _read_text(p: Path) -> str:
-    return p.read_text(encoding="utf-8", errors="ignore")
-
-# -------------------------------
-# Java parsing & chunking
-# -------------------------------
-def _extract_javadoc_above(lines: List[str], from_line_1_based: int) -> str:
-    i = from_line_1_based - 2
-    while i >= 0 and lines[i].strip() == "":
-        i -= 1
-    if i < 0:
-        return ""
-    if "*/" in lines[i]:
-        end = i
-        while i >= 0:
-            if "/**" in lines[i]:
-                start = i
-                return "\n".join(lines[start:end+1])
-            i -= 1
-    return ""
-
-def _find_block_span(lines: List[str], start_line_1: int) -> Tuple[int, int]:
-    start_idx = start_line_1 - 1
-    text_from = "\n".join(lines[start_idx:])
-    brace_pos = text_from.find("{")
-    if brace_pos == -1:
-        return start_line_1, start_line_1
-    depth = 0; i = 0
-    for ch in text_from[brace_pos:]:
-        if ch == "{": depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0: break
+        if cur:
+            dm = DIFF_START.match(line)
+            if dm:
+                a_path, b_path = dm.group(1), dm.group(2)
+                diff = {"a": a_path, "b": b_path, "lines": []}
+                i += 1
+                while i < len(lines):
+                    l2 = lines[i]
+                    if COMMIT_LINE.match(l2) or DIFF_START.match(l2):
+                        break
+                    diff["lines"].append(l2)
+                    i += 1
+                cur["diffs"].append(diff)
+                continue
         i += 1
-    end_line = start_line_1 + (text_from[: brace_pos + i].count("\n"))
-    return start_line_1, max(start_line_1, end_line)
 
-def _format_signature(md) -> str:
-    try:
-        rt = getattr(md, 'return_type', None)
-        rt_str = getattr(rt, 'name', None) if rt else ('void' if getattr(md, 'constructor', False) else 'void')
-        params = []
-        for p in getattr(md, 'parameters', []) or []:
-            ptype = getattr(p.type, 'name', str(p.type))
-            pname = getattr(p, 'name', 'arg')
-            dims = '[]' * getattr(p, 'dimensions', 0)
-            params.append(f"{ptype}{dims} {pname}")
-        name = getattr(md, 'name', '<init>')
-        mods = ' '.join(sorted(getattr(md, 'modifiers', []) or []))
-        return f"{mods} {rt_str} {name}({', '.join(params)})".strip()
-    except Exception:
-        return str(md)
+    if cur:
+        commits.append(cur)
+    return commits
 
-METHOD_DECL_RE = re.compile(r"^(\s*(public|private|protected|static|final|synchronized|abstract)\s+)*\s*[\w\<\>\[\]]+\s+[\w]+\s*\([^\)]*\)\s*\{", re.M)
-
-def _java_ast_chunks(path: Path, collection: str, version: str) -> List[Chunk]:
-    if javalang is None:
-        return []
-    src = _read_text(path); lines = src.splitlines(); out: List[Chunk] = []
-    try:
-        tree = javalang.parse.parse(src)
-    except Exception:
-        return out
-    pkg = getattr(getattr(tree, 'package', None), 'name', None)
-    imports = [imp.path for imp in getattr(tree, 'imports', [])]
-    for type_decl in getattr(tree, 'types', []) or []:
-        class_name = getattr(type_decl, 'name', None)
-        for md in getattr(type_decl, 'methods', []) or []:
-            pos = getattr(md, 'position', None); line = pos.line if pos else 1
-            jdoc = _extract_javadoc_above(lines, line)
-            signature = _format_signature(md); method_name = getattr(md, 'name', None)
-            s_line, e_line = _find_block_span(lines, line)
-            raw_code = "\n".join(lines[s_line - 1:e_line])
-            header = HEADER_TEMPLATE.format(
-                collection=collection, version=version,
-                package=pkg or "", class_name=class_name or "",
-                method_name=method_name or "", signature=signature,
-                imports=", ".join(imports[:24])
-            )
-            content = "\n".join([header] + ([jdoc] if jdoc else []) + [raw_code])
-            tokens = TOK_COUNT(content)
-            if tokens > DEFAULT_HARD_CAP:
-                blocks = re.split(r"\n\s*\n+", raw_code)
-                current: List[str] = []; assembled: List[str] = []
-                for b in blocks:
-                    cand = "\n".join(current + [b])
-                    cand_content = "\n".join([header] + ([jdoc] if jdoc else []) + [cand])
-                    if TOK_COUNT(cand_content) > DEFAULT_MAX_TOKENS and current:
-                        assembled.append("\n\n".join(current))
-                        current = current[-1:] + [b]  # tiny overlap
-                    else:
-                        current.append(b)
-                if current: assembled.append("\n\n".join(current))
-                for part in assembled:
-                    part_content = "\n".join([header] + ([jdoc] if jdoc else []) + [part])
-                    out.append(_make_chunk(
-                        external_id=str(path), language="java", symbol_kind="method",
-                        is_recipe=False, is_config=False, is_example=False,
-                        package=pkg, class_name=class_name, method_name=method_name, signature=signature,
-                        start_line=s_line, end_line=e_line, tokens=TOK_COUNT(part_content),
-                        content=part_content, raw_code=part, meta={}
-                    ))
-            else:
-                out.append(_make_chunk(
-                    external_id=str(path), language="java", symbol_kind="method",
-                    is_recipe=False, is_config=False, is_example=False,
-                    package=pkg, class_name=class_name, method_name=method_name, signature=signature,
-                    start_line=s_line, end_line=e_line, tokens=tokens,
-                    content=content, raw_code=raw_code, meta={}
-                ))
-    return out
-
-def _java_fallback_chunks(path: Path, collection: str, version: str) -> List[Chunk]:
-    src = _read_text(path); lines = src.splitlines(); out: List[Chunk] = []
-    pkg_m = re.search(r"^\s*package\s+([\w\.]+)\s*;", src, re.M)
-    pkg = pkg_m.group(1) if pkg_m else None
-    imports = re.findall(r"^\s*import\s+([\w\.\*]+)\s*;", src, re.M)
-    cls_m = re.search(r"\b(class|interface|enum)\s+(\w+)", src)
-    class_name = cls_m.group(2) if cls_m else None
-    for m in METHOD_DECL_RE.finditer(src):
-        start = m.start(); start_line = src.count("\n", 0, start) + 1
-        s_line, e_line = _find_block_span(lines, start_line)
-        raw_code = "\n".join(lines[s_line - 1:e_line])
-        header = HEADER_TEMPLATE.format(
-            collection=collection, version=version, package=pkg or "",
-            class_name=class_name or "", method_name="", signature="(fallback)",
-            imports=", ".join(imports[:24])
-        )
-        content = header + "\n" + raw_code
-        out.append(_make_chunk(
-            external_id=str(path), language="java", symbol_kind="method",
-            is_recipe=False, is_config=False, is_example=False,
-            package=pkg, class_name=class_name, method_name=None, signature=None,
-            start_line=s_line, end_line=e_line, tokens=TOK_COUNT(content),
-            content=content, raw_code=raw_code, meta={}
-        ))
-    return out
-
-# -------------------------------
-# Config / build chunkers
-# -------------------------------
-def _flatten_yaml(d: Dict, prefix: str = "") -> List[Tuple[str, str]]:
-    pairs: List[Tuple[str, str]] = []
-    if isinstance(d, dict):
-        for k, v in d.items():
-            key = f"{prefix}{k}" if not prefix else f"{prefix}.{k}"
-            pairs.extend(_flatten_yaml(v, key))
-    elif isinstance(d, list):
-        for i, v in enumerate(d):
-            key = f"{prefix}[{i}]"
-            pairs.extend(_flatten_yaml(v, key))
-    else:
-        pairs.append((prefix, str(d)))
-    return pairs
-
-def _chunk_properties(path: Path, collection: str, version: str, batch: int = 6) -> List[Chunk]:
-    lines = _read_text(path).splitlines(); kvs: List[Tuple[str, str]] = []
+# ----------------- Detect bumps from diff lines -----------------
+def detect_gradle_bumps(lines: List[str]) -> List[Tuple[str,str,str]]:
+    """Return [(group:artifact, from, to)] from +/- lines in Gradle/KTS diffs."""
+    minus, plus = {}, {}
     for ln in lines:
-        ln = ln.strip()
-        if not ln or ln.startswith("#"): continue
-        if "=" in ln: k, v = ln.split("=", 1); kvs.append((k.strip(), v.strip()))
-        elif ":" in ln: k, v = ln.split(":", 1); kvs.append((k.strip(), v.strip()))
-    out: List[Chunk] = []
-    for i in range(0, len(kvs), batch):
-        group = kvs[i:i+batch]
-        body = "\n".join(f"{k}={v}" for k, v in group)
-        header = f"[Collection: {collection}]\n[Version: {version}]\n[Config File: {path.name}]\n[Path: {path}]\n"
-        content = header + "\n" + body
-        out.append(_make_chunk(
-            external_id=str(path), language="properties", symbol_kind="config",
-            is_recipe=False, is_config=True, is_example=False,
-            package=None, class_name=None, method_name=None, signature=None,
-            start_line=None, end_line=None, tokens=TOK_COUNT(content),
-            content=content, raw_code=body, meta={"config_keys":[k for k,_ in group]}
-        ))
-    return out
+        if not ln: continue
+        head, body = (ln[0], ln[1:]) if ln[0] in "+-" else (None, ln)
+        if head not in ("+","-"): continue
+        for m in GR_COORD_RE.finditer(body):
+            ga, ver = m.group(1), m.group(2)
+            if head == "-": minus[ga] = ver
+            elif head == "+": plus[ga] = ver
+    bumps = []
+    for ga in sorted(set(minus) & set(plus)):
+        if minus[ga] != plus[ga]:
+            bumps.append((ga, minus[ga], plus[ga]))
+    return bumps
 
-def _chunk_yaml(path: Path, collection: str, version: str, batch: int = 8) -> List[Chunk]:
-    if yaml is None: return []
-    try:
-        data = yaml.safe_load(_read_text(path))
-    except Exception:
-        return []
-    pairs = _flatten_yaml(data) if isinstance(data, (dict, list)) else []
-    out: List[Chunk] = []
-    for i in range(0, len(pairs), batch):
-        group = pairs[i:i+batch]; lines = [f"{k}: {v}" for k, v in group]; body = "\n".join(lines)
-        header = f"[Collection: {collection}]\n[Version: {version}]\n[Config File: {path.name}]\n[Path: {path}]\n"
-        content = header + "\n" + body
-        out.append(_make_chunk(
-            external_id=str(path), language="yaml", symbol_kind="config",
-            is_recipe=False, is_config=True, is_example=False,
-            package=None, class_name=None, method_name=None, signature=None,
-            start_line=None, end_line=None, tokens=TOK_COUNT(content),
-            content=content, raw_code=body, meta={"config_keys":[k for k,_ in group]}
-        ))
-    return out
+def detect_pom_bumps(lines: List[str]) -> List[Tuple[str,str,str]]:
+    """Track groupId/artifactId context and pair -<version> with +<version>."""
+    cur_g = cur_a = None
+    pending_from: Optional[str] = None
+    bumps: List[Tuple[str,str,str]] = []
+    for ln in lines:
+        if not ln: continue
+        head, body = (ln[0], ln[1:]) if ln[0] in "+- " else (None, ln)
+        mg = POM_G_RE.search(body); ma = POM_A_RE.search(body)
+        if mg: cur_g = mg.group(1).strip()
+        if ma: cur_a = ma.group(1).strip()
+        mv = POM_V_RE.search(body)
+        if head == "-" and mv:
+            pending_from = mv.group(1).strip()
+        elif head == "+" and mv and pending_from:
+            to_v = mv.group(1).strip()
+            if cur_g and cur_a and pending_from != to_v:
+                bumps.append((f"{cur_g}:{cur_a}", pending_from, to_v))
+            pending_from = None
+        if HUNK_START.match(ln):
+            pending_from = None
+    return bumps
 
-def _chunk_gradle(path: Path, collection: str, version: str) -> List[Chunk]:
-    text = _read_text(path)
-    deps = [ln.strip() for ln in text.splitlines()
-            if re.search(r"\b(implementation|api|compileOnly|runtimeOnly)\b\s*\(\"", ln)]
-    if not deps: return []
-    body = "\n".join(deps)
-    header = f"[Collection: {collection}]\n[Version: {version}]\n[Build File: {path.name}]\n[Path: {path}]\n"
-    content = header + "\n" + body
-    return [ _make_chunk(
-        external_id=str(path), language="gradle", symbol_kind="build",
-        is_recipe=False, is_config=False, is_example=False,
-        package=None, class_name=None, method_name=None, signature=None,
-        start_line=None, end_line=None, tokens=TOK_COUNT(content),
-        content=content, raw_code=body, meta={"artifacts_guess": deps[:5]}
-    ) ]
+# ----------------- Build chunks -----------------
+def short_diff_snippet(lines: List[str], artifact_hint: str, max_lines: int = 120) -> str:
+    out = []
+    kept = 0
+    pat = re.compile(r"version|"+re.escape(artifact_hint), re.I) if artifact_hint else re.compile(r"version", re.I)
+    for ln in lines:
+        if ln.startswith("@@"):
+            out.append(ln)
+            continue
+        if ln and ln[0] in "+-":
+            if pat.search(ln) or re.search(r"\d+\.\d+\.\d+", ln):
+                out.append(ln[:240]); kept += 1
+                if kept >= max_lines:
+                    break
+    return "\n".join(out) if out else ""
 
-def _chunk_pom(path: Path, collection: str, version: str) -> List[Chunk]:
-    try:
-        from lxml import etree
-        xml = etree.fromstring(_read_text(path).encode("utf-8"))
-        deps = xml.xpath("//dependency")
-        lines = []
-        for d in deps:
-            g = d.findtext("groupId") or ""
-            a = d.findtext("artifactId") or ""
-            v = d.findtext("version") or ""
-            scope = d.findtext("scope") or ""
-            lines.append(f"{g}:{a}:{v} {('['+scope+']') if scope else ''}")
-        if not lines: return []
-        body = "\n".join(lines)
-    except Exception:
-        return []
-    header = f"[Collection: {collection}]\n[Version: {version}]\n[Build File: {path.name}]\n[Path: {path}]\n"
-    content = header + "\n" + body
-    return [ _make_chunk(
-        external_id=str(path), language="maven", symbol_kind="build",
-        is_recipe=False, is_config=False, is_example=False,
-        package=None, class_name=None, method_name=None, signature=None,
-        start_line=None, end_line=None, tokens=TOK_COUNT(content),
-        content=content, raw_code=body, meta={"artifacts": lines}
-    ) ]
+def make_upgrade_edges(commits: List[dict], base_prefix: str) -> List[UpgradeEdge]:
+    edges: List[UpgradeEdge] = []
+    for c in commits:
+        chash, author, date = c.get("hash",""), c.get("author",""), c.get("date","")
+        for d in c["diffs"]:
+            bpath = d["b"]; name = Path(bpath).name
+            if name not in BUILD_FILES:
+                continue
+            lines = d["lines"]
+            bumps = detect_gradle_bumps(lines) if name in ("build.gradle","build.gradle.kts") else detect_pom_bumps(lines)
+            for (ga, v1, v2) in bumps:
+                group, artifact = ga.split(":", 1)
+                fw = first_segment_after(bpath, base_prefix)
+                delta = semver_delta(v1, v2)
+                snippet = short_diff_snippet(lines, artifact)
+                header = (
+                    f"[Upgrade]\n"
+                    f"Framework: {fw}\n"
+                    f"Commit: {chash}\n"
+                    f"Author: {author}\n"
+                    f"Date: {date}\n"
+                    f"File: {bpath}\n"
+                    f"Change: {ga} {v1} → {v2} ({delta})\n"
+                )
+                body = header + "\nDiff:\n" + (snippet if snippet else "(diff omitted)")
+                tags = ["upgrade"]
+                # light, generic framework tags derived from path or GA tokens (optional)
+                for t in ("logging","chassis","kafka","dynamodb","datasource","security","metrics"):
+                    if t in fw.lower() or t in artifact.lower():
+                        tags.append(t)
+                keywords = [fw, group, artifact, v1, v2, f"{artifact}:{v2}", "upgrade", delta]
+                edges.append(UpgradeEdge(
+                    framework_folder=fw, commit=chash, author=author, date=date, file=bpath,
+                    group=group, artifact=artifact, from_version=v1, to_version=v2,
+                    semver_delta=delta, content=body, tags=list(dict.fromkeys(tags)), keywords=keywords
+                ))
+    return edges
 
-# -------------------------------
-# README → recipe chunks
-# -------------------------------
-HEAD_RE = re.compile(r"^#{1,4}\s+(.*)$", re.M)
-FENCE_RE = re.compile(r"```(\w+)?\n(.*?)\n```", re.S)
-
-def _build_recipe_chunks_from_readme(readme: Path, collection: str, version: str, example_name: str) -> List[Chunk]:
-    text = _read_text(readme)
-    sections = [(m.group(1).strip(), m.start()) for m in HEAD_RE.finditer(text)]
-    if not sections: sections = [("Instructions", 0)]
-    sections.append(("__END__", len(text)))
-    spans = [(sections[i][0], text[sections[i][1]:sections[i+1][1]]) for i in range(len(sections)-1)]
-    out: List[Chunk] = []
-    for title, body in spans:
-        if title == "__END__": continue
-        fences = FENCE_RE.findall(body)
-        code_bits, cmds, artifacts, cfg_keys = [], [], [], []
-        for lang, code in fences:
-            lang = (lang or "").lower()
-            if lang in {"java","kotlin","kt"}: code_bits.append(code.strip())
-            elif lang in {"yaml","yml","properties"}:
-                code_bits.append(code.strip())
-                cfg_keys += re.findall(r"^[a-zA-Z0-9_.-]+\s*[:=]", code, re.M)
-            elif lang in {"bash","sh"}: cmds += [l.strip() for l in code.splitlines() if l.strip()]
-            elif lang in {"xml","gradle","groovy","kts"}: artifacts.append(code.strip())
-        if not code_bits and not cmds and not artifacts: continue
-        header = (
-            f"[Recipe: {title}]\n"
-            f"[Example: {example_name}]\n"
-            f"[Collection: {collection}]\n"
-            f"[Run: {cmds[0] if cmds else ''}]\n"
-            f"[ConfigKeys: {', '.join(k.split(':')[0].split('=')[0] for k in cfg_keys[:6])}]\n"
+def make_ledgers(edges: Iterable[UpgradeEdge]) -> List[VersionLedger]:
+    # Collect per (framework, group, artifact)
+    buckets: Dict[Tuple[str,str,str], Dict[str, Optional[str]]] = {}
+    for e in edges:
+        key = (e.framework_folder, e.group, e.artifact)
+        d = buckets.setdefault(key, {})
+        d[e.to_version] = e.date or d.get(e.to_version)  # store first date seen for to_version
+        d.setdefault(e.from_version, None)
+    ledgers: List[VersionLedger] = []
+    for (fw,g,a), vers in buckets.items():
+        # sort versions by semver_key
+        ordered = sorted(vers.keys(), key=semver_key)
+        latest = ordered[-1] if ordered else ""
+        latest_date = vers.get(latest)
+        content = (
+            f"[Versions]\nFramework: {fw}\nArtifact: {g}:{a}\n"
+            f"Observed: {', '.join(ordered)}\nLatest: {latest}" + (f" ({latest_date})" if latest_date else "")
         )
-        body_min = "\n\n".join(code_bits[:3])
-        content = header + "\n" + body_min
-        meta = {
-            "example_name": example_name,
-            "commands": cmds[:5],
-            "artifacts": artifacts[:5],
-            "config_keys": [k.split(':')[0].split('=')[0] for k in cfg_keys[:10]],
-            "readme_path": str(readme),
-            "recipe_title": title,
-        }
-        out.append(_make_chunk(
-            external_id=str(readme), language="markdown", symbol_kind="recipe",
-            is_recipe=True, is_config=False, is_example=True,
-            package=None, class_name=None, method_name=None, signature=None,
-            start_line=None, end_line=None, tokens=TOK_COUNT(content),
-            content=content, raw_code=body_min, meta=meta
+        tags = ["versions","upgrade"]
+        keywords = [fw, g, a, latest, "latest","versions"]
+        ledgers.append(VersionLedger(
+            framework_folder=fw, group=g, artifact=a,
+            versions=ordered, latest=latest, latest_date=latest_date,
+            content=content, tags=tags, keywords=keywords
         ))
-    return out
+    return ledgers
 
-def _find_example_readmes(root: Path) -> List[Path]:
-    cands = []
-    for p in root.rglob("README.md"):
-        parent = p.parent.name.lower()
-        if parent in {"examples","example","samples","sample"} or "example" in parent or "sample" in parent:
-            cands.append(p)
-    if not cands:
-        cands = list(root.rglob("README.md"))
-    return cands
-
-# -------------------------------
-# Chunk factory
-# -------------------------------
-def _make_chunk(
-    external_id: str, language: str, symbol_kind: str,
-    is_recipe: bool, is_config: bool, is_example: bool,
-    package: Optional[str], class_name: Optional[str], method_name: Optional[str], signature: Optional[str],
-    start_line: Optional[int], end_line: Optional[int], tokens: int,
-    content: str, raw_code: Optional[str], meta: Dict
-) -> Chunk:
-    hash_src = f"{external_id}|{start_line}|{end_line}|{hashlib.sha1(content.encode()).hexdigest()}"
-    return Chunk(
-        external_id=external_id, language=language, symbol_kind=symbol_kind,
-        is_recipe=is_recipe, is_config=is_config, is_example=is_example,
-        package=package, class_name=class_name, method_name=method_name, signature=signature,
-        start_line=start_line, end_line=end_line, tokens=tokens,
-        content=content, raw_code=raw_code, meta=meta, hash_key=hash_src
-    )
-
-# -------------------------------
-# Embeddings
-# -------------------------------
-def get_embedder(embedding_dim: int):
-    provider = os.getenv("EMBED_PROVIDER", "none").lower()
-    if provider == "openai":
-        try:
-            from openai import OpenAI  # type: ignore
-        except Exception:
-            raise RuntimeError("Install openai>=1.0.0 for OPENAI provider")
-        model = os.getenv("EMBED_MODEL", "text-embedding-3-small")
-        client = OpenAI()
-        def embed(text: str) -> np.ndarray:
-            if len(text) > 200_000: text = text[:200_000]
-            out = client.embeddings.create(model=model, input=text)
-            vec = np.array(out.data[0].embedding, dtype=np.float32)
-            if vec.shape[0] != embedding_dim:
-                raise RuntimeError(f"Embedding dim {vec.shape[0]} != table dim {embedding_dim}")
-            return vec
-        return embed
-    elif provider == "none":
-        def embed(_text: str) -> np.ndarray:
-            return np.zeros((embedding_dim,), dtype=np.float32)
-        return embed
-    else:
-        raise RuntimeError(f"Unsupported EMBED_PROVIDER={provider}")
-
-# -------------------------------
-# Postgres schema & SQL
-# -------------------------------
-DDL = """
+# ----------------- Postgres (optional) -----------------
+DDL_TMPL = """
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
 
 CREATE TABLE IF NOT EXISTS kb_collections (
-  id             BIGSERIAL PRIMARY KEY,
-  name           TEXT UNIQUE NOT NULL,
-  kb_type        TEXT NOT NULL,
-  description    TEXT,
-  embedding_dim  INT NOT NULL DEFAULT {dim},
-  distance       TEXT NOT NULL DEFAULT 'cosine',
-  metadata       JSONB DEFAULT '{{}}'::jsonb,
-  created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+  id BIGSERIAL PRIMARY KEY,
+  name TEXT UNIQUE NOT NULL,
+  kb_type TEXT NOT NULL,
+  description TEXT,
+  embedding_dim INT NOT NULL,
+  distance TEXT NOT NULL DEFAULT 'cosine',
+  metadata JSONB DEFAULT '{{}}',
+  created_at TIMESTAMPTZ DEFAULT now()
 );
 
 CREATE TABLE IF NOT EXISTS kb_chunks (
-  id             BIGSERIAL PRIMARY KEY,
-  collection_id  BIGINT NOT NULL REFERENCES kb_collections(id) ON DELETE CASCADE,
-  external_id    TEXT,
-  language       TEXT,
-  symbol_kind    TEXT,
-  is_recipe      BOOLEAN DEFAULT FALSE,
-  is_config      BOOLEAN DEFAULT FALSE,
-  is_example     BOOLEAN DEFAULT FALSE,
-  package        TEXT,
-  class_name     TEXT,
-  method_name    TEXT,
-  signature      TEXT,
-  start_line     INT,
-  end_line       INT,
-  tokens         INT,
-  content        TEXT NOT NULL,
-  raw_code       TEXT,
-  metadata       JSONB DEFAULT '{{}}'::jsonb,
-  embedding      VECTOR({dim}),
-  hash_key       TEXT UNIQUE
+  id BIGSERIAL PRIMARY KEY,
+  collection_id BIGINT NOT NULL REFERENCES kb_collections(id) ON DELETE CASCADE,
+  external_id TEXT,
+  language TEXT,
+  symbol_kind TEXT,
+  is_recipe BOOLEAN DEFAULT FALSE,
+  is_config BOOLEAN DEFAULT FALSE,
+  is_example BOOLEAN DEFAULT FALSE,
+  package TEXT,
+  class_name TEXT,
+  method_name TEXT,
+  signature TEXT,
+  start_line INT,
+  end_line INT,
+  tokens INT,
+  content TEXT NOT NULL,
+  raw_code TEXT,
+  metadata JSONB DEFAULT '{{}}',
+  embedding VECTOR({dim}),
+  hash_key TEXT UNIQUE
 );
 
-CREATE INDEX IF NOT EXISTS kb_chunks_embedding_hnsw
-  ON kb_chunks USING hnsw (embedding vector_cosine_ops);
-CREATE INDEX IF NOT EXISTS kb_chunks_content_trgm
-  ON kb_chunks USING gin (content gin_trgm_ops);
-CREATE INDEX IF NOT EXISTS kb_chunks_collection ON kb_chunks(collection_id);
-CREATE INDEX IF NOT EXISTS kb_chunks_collection_kind ON kb_chunks(collection_id, symbol_kind);
+CREATE INDEX IF NOT EXISTS kb_chunks_embedding_hnsw ON kb_chunks USING hnsw (embedding vector_cosine_ops);
+CREATE INDEX IF NOT EXISTS kb_chunks_content_trgm   ON kb_chunks USING gin  (content gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS kb_chunks_collection     ON kb_chunks(collection_id);
 """
 
-INSERT_SQL = """
-INSERT INTO kb_chunks
-  (collection_id, external_id, language, symbol_kind, is_recipe, is_config, is_example,
-   package, class_name, method_name, signature, start_line, end_line, tokens,
-   content, raw_code, metadata, embedding, hash_key)
-VALUES %s
-ON CONFLICT (hash_key) DO NOTHING
-"""
+def insert_postgres(edges: List[UpgradeEdge],
+                    ledgers: List[VersionLedger],
+                    collection: str,
+                    embedding_dim: int):
+    import psycopg2
+    from pgvector.psycopg2 import register_vector
+    from psycopg2.extras import Json, execute_values
 
-# Stage 1: discover candidate collections
-CANDIDATE_COLLECTIONS_SQL = """
-WITH vec AS (
-  SELECT collection_id, 1 - (embedding <=> %s) AS vscore
-  FROM kb_chunks
-  ORDER BY embedding <=> %s
-  LIMIT 1000
-),
-lex AS (
-  SELECT collection_id, GREATEST(similarity(content, %s), 0) AS lscore
-  FROM kb_chunks
-  WHERE content % %s
-  ORDER BY lscore DESC
-  LIMIT 1000
-),
-unioned AS (
-  SELECT collection_id, vscore, 0::float AS lscore FROM vec
-  UNION ALL
-  SELECT collection_id, 0::float, lscore FROM lex
-),
-agg AS (
-  SELECT collection_id,
-         MAX(vscore) AS vscore,
-         MAX(lscore) AS lscore,
-         (0.7*MAX(vscore) + 0.3*MAX(lscore)) AS fused
-  FROM unioned
-  GROUP BY collection_id
-)
-SELECT collection_id
-FROM agg
-ORDER BY fused DESC
-LIMIT %s;
-"""
-
-# Stage 2: actual hybrid retrieve within chosen collections
-HYBRID_WITHIN_SQL = """
-WITH vec AS (
-  SELECT id, 1 - (embedding <=> %s) AS vscore
-  FROM kb_chunks
-  WHERE collection_id = ANY(%s)
-  ORDER BY embedding <=> %s
-  LIMIT 200
-),
-lex AS (
-  SELECT id, GREATEST(similarity(content, %s), 0) AS lscore
-  FROM kb_chunks
-  WHERE collection_id = ANY(%s) AND content % %s
-  ORDER BY lscore DESC
-  LIMIT 200
-),
-unioned AS (
-  SELECT id, vscore, 0::float AS lscore FROM vec
-  UNION ALL
-  SELECT id, 0::float, lscore FROM lex
-),
-agg AS (
-  SELECT id,
-         MAX(vscore) AS vscore,
-         MAX(lscore) AS lscore,
-         (0.7*MAX(vscore) + 0.3*MAX(lscore)
-          + 0.10*MAX(CASE WHEN is_example THEN 1 ELSE 0 END)
-          + 0.10*MAX(CASE WHEN is_recipe THEN 1 ELSE 0 END)
-          + 0.08*MAX(CASE WHEN is_config THEN 1 ELSE 0 END)) AS fused
-  FROM unioned
-  JOIN kb_chunks USING (id)
-  GROUP BY id
-)
-SELECT c.id, c.collection_id, c.external_id, c.symbol_kind, c.is_recipe, c.is_config, c.is_example,
-       a.vscore, a.lscore, a.fused, c.content
-FROM agg a
-JOIN kb_chunks c USING (id)
-ORDER BY a.fused DESC
-LIMIT %s;
-"""
-
-VEC_ONLY_WITHIN_SQL = """
-SELECT id, collection_id, external_id, symbol_kind, is_recipe, is_config, is_example,
-       1 - (embedding <=> %s) AS vscore, content
-FROM kb_chunks
-WHERE collection_id = ANY(%s)
-ORDER BY embedding <=> %s
-LIMIT %s;
-"""
-
-# -------------------------------
-# DB helpers
-# -------------------------------
-def _connect():
     conn = psycopg2.connect(
-        host=os.getenv("PGHOST", "localhost"),
-        port=int(os.getenv("PGPORT", "5432")),
+        host=os.getenv("PGHOST","localhost"),
+        port=int(os.getenv("PGPORT","5432")),
         dbname=os.getenv("PGDATABASE"),
         user=os.getenv("PGUSER"),
         password=os.getenv("PGPASSWORD"),
     )
     register_vector(conn)
-    return conn
-
-def get_or_create_collection(conn, name: str, kb_type: str, dim: int, description: str = "", metadata: dict | None = None) -> int:
-    metadata = metadata or {}
     with conn.cursor() as cur:
-        cur.execute("SELECT id, embedding_dim FROM kb_collections WHERE name=%s", (name,))
-        row = cur.fetchone()
-        if row:
-            cid, existing_dim = row
-            if existing_dim != dim:
-                print(f"[WARN] Collection '{name}' dim={existing_dim} (ignoring requested {dim}).", file=sys.stderr)
-            return cid
-        cur.execute("""
-            INSERT INTO kb_collections (name, kb_type, description, embedding_dim, metadata)
-            VALUES (%s,%s,%s,%s,%s)
-            RETURNING id
-        """, (name, kb_type, description, dim, Json(metadata)))
+        cur.execute(DDL_TMPL.format(dim=embedding_dim))
+        cur.execute("INSERT INTO kb_collections(name, kb_type, embedding_dim) VALUES (%s,%s,%s) ON CONFLICT DO NOTHING",
+                    (collection, "code", embedding_dim))
+        cur.execute("SELECT id FROM kb_collections WHERE name=%s", (collection,))
         cid = cur.fetchone()[0]
-    conn.commit()
-    return cid
 
-# -------------------------------
-# Build chunks (one repo)
-# -------------------------------
-def _should_skip_dir(p: Path) -> bool:
-    return p.name in IGNORE_DIRS or p.name.startswith(".")
+        rows = []
+        # Edges
+        for e in edges:
+            meta = {
+                "framework_folder": e.framework_folder,
+                "group": e.group, "artifact": e.artifact,
+                "from_version": e.from_version, "to_version": e.to_version,
+                "semver_delta": e.semver_delta,
+                "commit": e.commit, "author": e.author, "date": e.date,
+                "source_path": e.file,
+                "tags": e.tags, "keywords": e.keywords
+            }
+            hk = f"edge|{e.framework_folder}|{e.group}:{e.artifact}|{e.from_version}->{e.to_version}|{e.commit}"
+            rows.append((
+                cid, e.file, "text", e.symbol_kind, e.is_recipe, e.is_config, e.is_example,
+                None,None,None,None,None,None, 0,
+                e.content, None, Json(meta), [0.0]*embedding_dim, hk
+            ))
 
-def build_chunks(root: Path, collection: str, version: str, include_examples: bool = True) -> List[Chunk]:
-    chunks: List[Chunk] = []
-    for path in root.rglob("*"):
-        if path.is_dir():
-            if _should_skip_dir(path):  # skip noisy dirs
-                continue
-            else:
-                continue
-        # files
-        ext = path.suffix.lower(); name = path.name
-        try:
-            if ext in JAVA_EXTS:
-                ast_chunks = _java_ast_chunks(path, collection, version)
-                chunks.extend(ast_chunks if ast_chunks else _java_fallback_chunks(path, collection, version))
-            elif ext in CONFIG_PROPS_EXTS:
-                chunks.extend(_chunk_properties(path, collection, version))
-            elif ext in CONFIG_YAML_EXTS:
-                chunks.extend(_chunk_yaml(path, collection, version))
-            elif name in BUILD_GRADLE:
-                chunks.extend(_chunk_gradle(path, collection, version))
-            elif name in POM_FILES:
-                chunks.extend(_chunk_pom(path, collection, version))
-        except Exception as e:
-            print(f"[WARN] Failed: {path}: {e}", file=sys.stderr)
-    if include_examples:
-        for readme in _find_example_readmes(root):
-            # avoid READMEs in ignored dirs
-            if any(seg in IGNORE_DIRS for seg in readme.parts): continue
-            example_name = readme.parent.name
-            chunks.extend(_build_recipe_chunks_from_readme(readme, collection, version, example_name))
-    return chunks
+        # Ledgers
+        for L in ledgers:
+            meta = {
+                "framework_folder": L.framework_folder,
+                "group": L.group, "artifact": L.artifact,
+                "versions": L.versions, "latest": L.latest, "latest_date": L.latest_date,
+                "tags": L.tags, "keywords": L.keywords
+            }
+            hk = f"ledger|{L.framework_folder}|{L.group}:{L.artifact}"
+            rows.append((
+                cid, f"versions/{L.framework_folder}/{L.group}:{L.artifact}", "text",
+                L.symbol_kind, L.is_recipe, L.is_config, L.is_example,
+                None,None,None,None,None,None, 0,
+                L.content, None, Json(meta), [0.0]*embedding_dim, hk
+            ))
 
-# -------------------------------
-# Ingest (one collection)
-# -------------------------------
-def ingest_one(root: Path, collection: str, kb_type: str, version: str, embedding_dim: int):
-    conn = _connect()
-    with conn.cursor() as cur:
-        cur.execute(DDL.format(dim=embedding_dim))
-    conn.commit()
+        execute_values(cur, """
+          INSERT INTO kb_chunks
+          (collection_id, external_id, language, symbol_kind, is_recipe, is_config, is_example,
+           package, class_name, method_name, signature, start_line, end_line, tokens,
+           content, raw_code, metadata, embedding, hash_key)
+          VALUES %s
+          ON CONFLICT (hash_key) DO NOTHING
+        """, rows, page_size=200)
+    conn.commit(); conn.close()
 
-    cid = get_or_create_collection(conn, collection, kb_type, embedding_dim)
-    embed = get_embedder(embedding_dim)
-
-    chunks = build_chunks(root, collection, version, include_examples=True)
-    print(f"[{collection}] built {len(chunks)} chunks", file=sys.stderr)
-
-    batch = 200; idx = 0
-    with conn.cursor() as cur:
-        while idx < len(chunks):
-            part = chunks[idx: idx+batch]
-            rows = []
-            for c in part:
-                vec = embed(c.content).tolist()
-                rows.append((
-                    cid, c.external_id, c.language, c.symbol_kind, c.is_recipe, c.is_config, c.is_example,
-                    c.package, c.class_name, c.method_name, c.signature, c.start_line, c.end_line, c.tokens,
-                    c.content, c.raw_code, Json(c.meta), vec, c.hash_key
-                ))
-            execute_values(cur, INSERT_SQL, rows, page_size=batch)
-            conn.commit(); idx += batch
-            print(f"[{collection}] inserted {min(idx, len(chunks))}/{len(chunks)}", file=sys.stderr)
-    conn.close()
-
-# -------------------------------
-# Ingest every child directory as its own collection
-# -------------------------------
-def _load_name_map(path: Optional[str]) -> Dict[str, str]:
-    if not path: return {}
-    p = Path(path)
-    try:
-        if p.suffix.lower() in {".yaml", ".yml"} and yaml:
-            return yaml.safe_load(p.read_text(encoding="utf-8")) or {}
-        else:
-            return json.loads(p.read_text(encoding="utf-8"))
-    except Exception as e:
-        print(f"[WARN] Could not load name map {path}: {e}", file=sys.stderr)
-        return {}
-
-def ingest_parent(parent_root: Path, kb_type: str, version: str, embedding_dim: int,
-                  name_prefix: str = "", name_map_path: Optional[str] = None):
-    name_map = _load_name_map(name_map_path)
-    for child in sorted(parent_root.iterdir()):
-        if not child.is_dir(): continue
-        if _should_skip_dir(child): continue
-        collection = name_map.get(child.name, f"{name_prefix}{child.name}")
-        print(f"==> Ingesting collection '{collection}' from {child}", file=sys.stderr)
-        ingest_one(child, collection, kb_type, version, embedding_dim)
-
-# -------------------------------
-# Search (auto-routed)
-# -------------------------------
-def _embed_query_vector(embedding_dim: int, text: str) -> List[float]:
-    embed = get_embedder(embedding_dim)
-    return embed(text).tolist()
-
-def _expand_query(query: str, synonyms_path: Optional[str]) -> str:
-    if not synonyms_path: return query
-    p = Path(synonyms_path); expansion = []
-    try:
-        if p.suffix.lower() in {".yaml", ".yml"} and yaml:
-            data = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
-        else:
-            data = json.loads(p.read_text(encoding="utf-8"))
-        for key, extra in (data or {}).items():
-            if key.lower() in query.lower():
-                if isinstance(extra, str): expansion.append(extra)
-                elif isinstance(extra, list): expansion.extend(extra)
-    except Exception as e:
-        print(f"[WARN] Failed to load synonyms {synonyms_path}: {e}", file=sys.stderr)
-    if expansion:
-        return query + " " + " ".join(expansion)
-    return query
-
-def auto_route_search(query: str, k: int, top_collections: int, embedding_dim: int,
-                      vec_only: bool = False, synonyms_path: Optional[str] = None):
-    conn = _connect()
-    q_expanded = _expand_query(query, synonyms_path)
-    emb = _embed_query_vector(embedding_dim, q_expanded)
-    with conn.cursor() as cur:
-        # 1) Candidate collections
-        cur.execute(CANDIDATE_COLLECTIONS_SQL, (emb, emb, q_expanded, q_expanded, top_collections))
-        ids = [r[0] for r in cur.fetchall()]
-        if not ids:
-            conn.close()
-            return []
-        # 2) Retrieve within selected collections
-        if vec_only:
-            cur.execute(VEC_ONLY_WITHIN_SQL, (emb, ids, emb, k))
-            rows = cur.fetchall()
-        else:
-            cur.execute(HYBRID_WITHIN_SQL, (emb, ids, emb, q_expanded, ids, q_expanded, k))
-            rows = cur.fetchall()
-    conn.close()
-    return rows, ids
-
-# -------------------------------
-# CLI
-# -------------------------------
+# ----------------- CLI -----------------
 def main():
-    ap = argparse.ArgumentParser(description="PGVector RAG (kb_collections + kb_chunks) with auto-routed retrieval")
-    sub = ap.add_subparsers(dest="cmd", required=True)
-
-    ap_ing = sub.add_parser("ingest", help="Ingest one collection from --root")
-    ap_ing.add_argument("--root", required=True)
-    ap_ing.add_argument("--collection", required=True)
-    ap_ing.add_argument("--kb-type", default="code")
-    ap_ing.add_argument("--version", default="0.0.0")
-    ap_ing.add_argument("--embedding-dim", type=int, default=int(os.getenv("EMBEDDING_DIM", "1536")))
-
-    ap_ip = sub.add_parser("ingest-parent", help="Ingest each child directory as its own collection")
-    ap_ip.add_argument("--parent-root", required=True)
-    ap_ip.add_argument("--kb-type", default="code")
-    ap_ip.add_argument("--version", default="0.0.0")
-    ap_ip.add_argument("--embedding-dim", type=int, default=int(os.getenv("EMBEDDING_DIM", "1536")))
-    ap_ip.add_argument("--name-prefix", default="")
-    ap_ip.add_argument("--name-map", default=None, help="YAML/JSON mapping: folder_name -> collection_name")
-
-    ap_sa = sub.add_parser("search-auto", help="Auto-route query to top-N collections and retrieve")
-    ap_sa.add_argument("--query", required=True)
-    ap_sa.add_argument("--k", type=int, default=8)
-    ap_sa.add_argument("--top-collections", type=int, default=5)
-    ap_sa.add_argument("--embedding-dim", type=int, default=int(os.getenv("EMBEDDING_DIM", "1536")))
-    ap_sa.add_argument("--vec-only", action="store_true")
-    ap_sa.add_argument("--synonyms", default=None, help="Optional YAML/JSON for query expansion")
-
+    ap = argparse.ArgumentParser(description="Generate upgrade chunks from a `git log -p` file.")
+    ap.add_argument("--log-file", required=True, help="Path to file produced by `git log -p` (prefer --date=iso-strict --no-color).")
+    ap.add_argument("--base-prefix", default="frameworks/", help="Path prefix to infer the framework folder (e.g., 'frameworks/').")
+    ap.add_argument("--edges-out", default="upgrade_edges.jsonl", help="Where to write upgrade edge chunks (JSONL).")
+    ap.add_argument("--ledgers-out", default="version_ledgers.jsonl", help="Where to write version ledger chunks (JSONL).")
+    ap.add_argument("--insert", action="store_true", help="Insert both edges and ledgers into Postgres.")
+    ap.add_argument("--collection", default="code-java", help="Collection name for Postgres insert.")
+    ap.add_argument("--embedding-dim", type=int, default=1024, help="Embedding dimension for pgvector column.")
     args = ap.parse_args()
 
-    if args.cmd == "ingest":
-        root = Path(args.root).expanduser().resolve()
-        if not root.exists():
-            print(f"Root not found: {root}", file=sys.stderr); sys.exit(2)
-        # Ensure schema before ingest
-        conn = _connect()
-        with conn.cursor() as cur: cur.execute(DDL.format(dim=args.embedding_dim))
-        conn.commit(); conn.close()
-        ingest_one(root, args.collection, args.kb_type, args.version, args.embedding_dim)
+    commits = parse_gitlog(Path(args.log_file))
+    edges = make_upgrade_edges(commits, args.base_prefix)
+    ledgers = make_ledgers(edges)
 
-    elif args.cmd == "ingest-parent":
-        parent = Path(args.parent_root).expanduser().resolve()
-        if not parent.exists():
-            print(f"Parent root not found: {parent}", file=sys.stderr); sys.exit(2)
-        conn = _connect()
-        with conn.cursor() as cur: cur.execute(DDL.format(dim=args.embedding_dim))
-        conn.commit(); conn.close()
-        ingest_parent(parent, args.kb_type, args.version, args.embedding_dim,
-                      name_prefix=args.name_prefix, name_map_path=args.name_map)
+    # JSONL outputs
+    with open(args.edges_out, "w", encoding="utf-8") as f:
+        for e in edges:
+            f.write(json.dumps(asdict(e), ensure_ascii=False) + "\n")
+    with open(args.ledgers_out, "w", encoding="utf-8") as f:
+        for L in ledgers:
+            f.write(json.dumps(asdict(L), ensure_ascii=False) + "\n")
 
-    elif args.cmd == "search-auto":
-        rows, ids = auto_route_search(args.query, args.k, args.top_collections, args.embedding_dim,
-                                      vec_only=args.vec_only, synonyms_path=args.synonyms)
-        print(f"[auto] candidate collections: {ids}")
-        for r in rows:
-            if len(r) == 10:   # vec-only
-                (_id, coll_id, ext, kind, is_rec, is_cfg, is_ex, v, content) = r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8]
-                print(f"[c{coll_id}] {kind:6} | {ext} | vscore={v:.3f}")
-            else:              # hybrid
-                (_id, coll_id, ext, kind, is_rec, is_cfg, is_ex, v, l, f, content) = r
-                print(f"[c{coll_id}] {kind:6} | {ext} | score={f:.3f}")
+    print(f"[ok] commits: {len(commits)} | edges: {len(edges)} | ledgers: {len(ledgers)}")
+    print(f"[ok] wrote {args.edges_out} and {args.ledgers_out}")
+
+    if args.insert:
+        insert_postgres(edges, ledgers, args.collection, args.embedding_dim)
+        print("[ok] inserted into Postgres")
 
 if __name__ == "__main__":
     main()
