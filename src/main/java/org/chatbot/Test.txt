@@ -280,3 +280,96 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
+#!/usr/bin/env python3
+# convert_edges_ledgers_for_ingest.py
+import argparse, json
+from pathlib import Path
+
+def iter_jsonl(path):
+    if not path: return []
+    rows = []
+    with open(path, "r", encoding="utf-8") as f:
+        for ln in f:
+            ln = ln.strip()
+            if ln:
+                rows.append(json.loads(ln))
+    return rows
+
+def edge_to_row(e: dict) -> dict:
+    # Fields produced by gitlog_to_upgrade_chunks.py (UpgradeEdge dataclass)
+    meta = {
+        "framework_folder": e.get("framework_folder"),
+        "group": e.get("group"),
+        "artifact": e.get("artifact"),
+        "from_version": e.get("from_version"),
+        "to_version": e.get("to_version"),
+        "semver_delta": e.get("semver_delta"),
+        "commit": e.get("commit"),
+        "author": e.get("author"),
+        "date": e.get("date"),
+        "source_path": e.get("file"),
+        "tags": e.get("tags") or ["upgrade"],
+        "keywords": e.get("keywords") or [],
+    }
+    return {
+        "external_id": e.get("file") or f"git:{e.get('commit','')}",
+        "language": "text",
+        "symbol_kind": e.get("symbol_kind", "upgrade"),
+        "is_recipe": True,
+        "is_config": False,
+        "is_example": False,
+        "content": e.get("content", ""),
+        "raw_code": None,
+        "metadata": meta,
+        "embedding": None  # keep None → kb_ingest.py will store zeros
+    }
+
+def ledger_to_row(L: dict) -> dict:
+    # Fields produced by gitlog_to_upgrade_chunks.py (VersionLedger dataclass)
+    fw = L.get("framework_folder")
+    g  = L.get("group")
+    a  = L.get("artifact")
+    meta = {
+        "framework_folder": fw,
+        "group": g,
+        "artifact": a,
+        "versions": L.get("versions") or [],
+        "latest": L.get("latest"),
+        "latest_date": L.get("latest_date"),
+        "tags": (L.get("tags") or []) + ["versions"],
+        "keywords": L.get("keywords") or [],
+    }
+    return {
+        "external_id": f"versions/{fw}/{g}:{a}",
+        "language": "text",
+        "symbol_kind": L.get("symbol_kind", "version_ledger"),
+        "is_recipe": False,
+        "is_config": False,
+        "is_example": False,
+        "content": L.get("content", ""),
+        "raw_code": None,
+        "metadata": meta,
+        "embedding": None
+    }
+
+def main():
+    ap = argparse.ArgumentParser(description="Convert edges + ledgers JSONL into kb_ingest.py row format")
+    ap.add_argument("--edges", required=True, help="upgrade_edges.jsonl from gitlog parser")
+    ap.add_argument("--ledgers", required=True, help="versions_ledger.jsonl from gitlog parser")
+    ap.add_argument("--out", required=True, help="output JSONL for kb_ingest.py --input-jsonl")
+    args = ap.parse_args()
+
+    edges = iter_jsonl(args.edges)
+    ledgers = iter_jsonl(args.ledgers)
+
+    rows = [edge_to_row(e) for e in edges] + [ledger_to_row(L) for L in ledgers]
+
+    Path(args.out).write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in rows) + "\n", encoding="utf-8")
+    print(f"[ok] wrote {len(rows)} rows to {args.out}")
+
+if __name__ == "__main__":
+    main()
