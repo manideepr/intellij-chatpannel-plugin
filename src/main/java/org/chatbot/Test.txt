@@ -1,322 +1,15 @@
-#!/usr/bin/env python3
-"""
-Parse a `git log -p` file and produce:
-  1) Upgrade Edge chunks: each dependency bump (from_version -> to_version)
-  2) Version Ledger chunks: per artifact, observed versions and latest
-
-Outputs JSONL by default; optionally inserts into Postgres (pgvector schema).
-"""
-
+ #!/usr/bin/env python3
 from __future__ import annotations
-import argparse, json, os, re, sys
-from dataclasses import dataclass, asdict
+import argparse, json, os, re, sys, textwrap
+from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Dict, Tuple, Optional, Iterable
+from typing import Any, Dict, List, Optional, Tuple
 
-# ----------------- Patterns -----------------
-BUILD_FILES = {"pom.xml", "build.gradle", "build.gradle.kts"}
-GR_COORD_RE = re.compile(r'["\']([A-Za-z0-9_.\-]+:[A-Za-z0-9_.\-]+):([A-Za-z0-9+_.\-]+)["\']')
-POM_G_RE = re.compile(r"<groupId>\s*([^<]+)\s*</groupId>", re.I)
-POM_A_RE = re.compile(r"<artifactId>\s*([^<]+)\s*</artifactId>", re.I)
-POM_V_RE = re.compile(r"<version>\s*([^<]+)\s*</version>", re.I)
+import psycopg2
+from pgvector.psycopg2 import register_vector
 
-COMMIT_LINE = re.compile(r"^commit\s+([0-9a-f]{7,40})\b", re.I)
-AUTHOR_LINE = re.compile(r"^Author:\s*(.+)$", re.I)
-DATE_LINE   = re.compile(r"^Date:\s*(.+)$", re.I)
-DIFF_START  = re.compile(r"^diff --git a/(.+?) b/(.+)$")
-HUNK_START  = re.compile(r"^@@ ")
-ANSI        = re.compile(r"\x1b\[[0-9;]*m")  # strip ANSI if present
-
-SEMVER = re.compile(r"^(\d+)\.(\d+)\.(\d+)(?:[+.-].*)?$")
-
-def semver_key(v: str) -> tuple[int,int,int,int]:
-    """Sort key: semantic triplet, then a stable tiebreaker by length to push pure semver above qualifiers."""
-    m = SEMVER.match(v or "")
-    if not m:
-        return (0,0,0,-len(v))
-    return (int(m.group(1)), int(m.group(2)), int(m.group(3)), 0)
-
-def semver_delta(a: str, b: str) -> str:
-    ma, mb = SEMVER.match(a or ""), SEMVER.match(b or "")
-    if not (ma and mb): return "other"
-    A = (int(ma.group(1)), int(ma.group(2)), int(ma.group(3)))
-    B = (int(mb.group(1)), int(mb.group(2)), int(mb.group(3)))
-    if A[0] != B[0]: return "major"
-    if A[1] != B[1]: return "minor"
-    if A[2] != B[2]: return "patch"
-    return "other"
-
-def first_segment_after(path: str, base_prefix: str) -> str:
-    path = path.lstrip("/")
-    if base_prefix and base_prefix in path:
-        _, after = path.split(base_prefix, 1)
-        after = after.lstrip("/")
-        return after.split("/", 1)[0] if after else base_prefix.strip("/").split("/")[-1]
-    return path.split("/", 1)[0] if "/" in path else path
-
-# ----------------- Data -----------------
-@dataclass
-class UpgradeEdge:
-    framework_folder: str
-    commit: str
-    author: str
-    date: str
-    file: str
-    group: str
-    artifact: str
-    from_version: str
-    to_version: str
-    semver_delta: str
-    content: str           # small header + compact diff snippet
-    tags: List[str]
-    keywords: List[str]
-    symbol_kind: str = "upgrade"
-    is_recipe: bool = True
-    is_config: bool = False
-    is_example: bool = False
-
-@dataclass
-class VersionLedger:
-    framework_folder: str
-    group: str
-    artifact: str
-    versions: List[str]    # sorted ascending
-    latest: str
-    latest_date: Optional[str]
-    content: str           # small human-readable ledger
-    tags: List[str]
-    keywords: List[str]
-    symbol_kind: str = "version_ledger"
-    is_recipe: bool = False
-    is_config: bool = False
-    is_example: bool = False
-
-# ----------------- Parse git log -p file -----------------
-def parse_gitlog(file_path: Path) -> List[dict]:
-    """
-    Return a list of commits:
-      {hash, author, date, diffs: [{a, b, lines: [...] }]}
-    """
-    txt = ANSI.sub("", file_path.read_text(encoding="utf-8", errors="ignore"))
-    lines = txt.splitlines()
-
-    commits: List[dict] = []
-    cur: Optional[dict] = None
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        m = COMMIT_LINE.match(line)
-        if m:
-            if cur:
-                commits.append(cur)
-            cur = {"hash": m.group(1), "author": "", "date": "", "diffs": []}
-            i += 1
-            # header
-            while i < len(lines):
-                l = lines[i]
-                if DIFF_START.match(l) or l.strip() == "":
-                    break
-                am = AUTHOR_LINE.match(l)
-                dm = DATE_LINE.match(l)
-                if am: cur["author"] = am.group(1).strip()
-                if dm: cur["date"]   = dm.group(1).strip()
-                i += 1
-            continue
-
-        if cur:
-            dm = DIFF_START.match(line)
-            if dm:
-                a_path, b_path = dm.group(1), dm.group(2)
-                diff = {"a": a_path, "b": b_path, "lines": []}
-                i += 1
-                while i < len(lines):
-                    l2 = lines[i]
-                    if COMMIT_LINE.match(l2) or DIFF_START.match(l2):
-                        break
-                    diff["lines"].append(l2)
-                    i += 1
-                cur["diffs"].append(diff)
-                continue
-        i += 1
-
-    if cur:
-        commits.append(cur)
-    return commits
-
-# ----------------- Detect bumps from diff lines -----------------
-def detect_gradle_bumps(lines: List[str]) -> List[Tuple[str,str,str]]:
-    """Return [(group:artifact, from, to)] from +/- lines in Gradle/KTS diffs."""
-    minus, plus = {}, {}
-    for ln in lines:
-        if not ln: continue
-        head, body = (ln[0], ln[1:]) if ln[0] in "+-" else (None, ln)
-        if head not in ("+","-"): continue
-        for m in GR_COORD_RE.finditer(body):
-            ga, ver = m.group(1), m.group(2)
-            if head == "-": minus[ga] = ver
-            elif head == "+": plus[ga] = ver
-    bumps = []
-    for ga in sorted(set(minus) & set(plus)):
-        if minus[ga] != plus[ga]:
-            bumps.append((ga, minus[ga], plus[ga]))
-    return bumps
-
-def detect_pom_bumps(lines: List[str]) -> List[Tuple[str,str,str]]:
-    """Track groupId/artifactId context and pair -<version> with +<version>."""
-    cur_g = cur_a = None
-    pending_from: Optional[str] = None
-    bumps: List[Tuple[str,str,str]] = []
-    for ln in lines:
-        if not ln: continue
-        head, body = (ln[0], ln[1:]) if ln[0] in "+- " else (None, ln)
-        mg = POM_G_RE.search(body); ma = POM_A_RE.search(body)
-        if mg: cur_g = mg.group(1).strip()
-        if ma: cur_a = ma.group(1).strip()
-        mv = POM_V_RE.search(body)
-        if head == "-" and mv:
-            pending_from = mv.group(1).strip()
-        elif head == "+" and mv and pending_from:
-            to_v = mv.group(1).strip()
-            if cur_g and cur_a and pending_from != to_v:
-                bumps.append((f"{cur_g}:{cur_a}", pending_from, to_v))
-            pending_from = None
-        if HUNK_START.match(ln):
-            pending_from = None
-    return bumps
-
-# ----------------- Build chunks -----------------
-def short_diff_snippet(lines: List[str], artifact_hint: str, max_lines: int = 120) -> str:
-    out = []
-    kept = 0
-    pat = re.compile(r"version|"+re.escape(artifact_hint), re.I) if artifact_hint else re.compile(r"version", re.I)
-    for ln in lines:
-        if ln.startswith("@@"):
-            out.append(ln)
-            continue
-        if ln and ln[0] in "+-":
-            if pat.search(ln) or re.search(r"\d+\.\d+\.\d+", ln):
-                out.append(ln[:240]); kept += 1
-                if kept >= max_lines:
-                    break
-    return "\n".join(out) if out else ""
-
-def make_upgrade_edges(commits: List[dict], base_prefix: str) -> List[UpgradeEdge]:
-    edges: List[UpgradeEdge] = []
-    for c in commits:
-        chash, author, date = c.get("hash",""), c.get("author",""), c.get("date","")
-        for d in c["diffs"]:
-            bpath = d["b"]; name = Path(bpath).name
-            if name not in BUILD_FILES:
-                continue
-            lines = d["lines"]
-            bumps = detect_gradle_bumps(lines) if name in ("build.gradle","build.gradle.kts") else detect_pom_bumps(lines)
-            for (ga, v1, v2) in bumps:
-                group, artifact = ga.split(":", 1)
-                fw = first_segment_after(bpath, base_prefix)
-                delta = semver_delta(v1, v2)
-                snippet = short_diff_snippet(lines, artifact)
-                header = (
-                    f"[Upgrade]\n"
-                    f"Framework: {fw}\n"
-                    f"Commit: {chash}\n"
-                    f"Author: {author}\n"
-                    f"Date: {date}\n"
-                    f"File: {bpath}\n"
-                    f"Change: {ga} {v1} → {v2} ({delta})\n"
-                )
-                body = header + "\nDiff:\n" + (snippet if snippet else "(diff omitted)")
-                tags = ["upgrade"]
-                # light, generic framework tags derived from path or GA tokens (optional)
-                for t in ("logging","chassis","kafka","dynamodb","datasource","security","metrics"):
-                    if t in fw.lower() or t in artifact.lower():
-                        tags.append(t)
-                keywords = [fw, group, artifact, v1, v2, f"{artifact}:{v2}", "upgrade", delta]
-                edges.append(UpgradeEdge(
-                    framework_folder=fw, commit=chash, author=author, date=date, file=bpath,
-                    group=group, artifact=artifact, from_version=v1, to_version=v2,
-                    semver_delta=delta, content=body, tags=list(dict.fromkeys(tags)), keywords=keywords
-                ))
-    return edges
-
-def make_ledgers(edges: Iterable[UpgradeEdge]) -> List[VersionLedger]:
-    # Collect per (framework, group, artifact)
-    buckets: Dict[Tuple[str,str,str], Dict[str, Optional[str]]] = {}
-    for e in edges:
-        key = (e.framework_folder, e.group, e.artifact)
-        d = buckets.setdefault(key, {})
-        d[e.to_version] = e.date or d.get(e.to_version)  # store first date seen for to_version
-        d.setdefault(e.from_version, None)
-    ledgers: List[VersionLedger] = []
-    for (fw,g,a), vers in buckets.items():
-        # sort versions by semver_key
-        ordered = sorted(vers.keys(), key=semver_key)
-        latest = ordered[-1] if ordered else ""
-        latest_date = vers.get(latest)
-        content = (
-            f"[Versions]\nFramework: {fw}\nArtifact: {g}:{a}\n"
-            f"Observed: {', '.join(ordered)}\nLatest: {latest}" + (f" ({latest_date})" if latest_date else "")
-        )
-        tags = ["versions","upgrade"]
-        keywords = [fw, g, a, latest, "latest","versions"]
-        ledgers.append(VersionLedger(
-            framework_folder=fw, group=g, artifact=a,
-            versions=ordered, latest=latest, latest_date=latest_date,
-            content=content, tags=tags, keywords=keywords
-        ))
-    return ledgers
-
-# ----------------- Postgres (optional) -----------------
-DDL_TMPL = """
-CREATE EXTENSION IF NOT EXISTS vector;
-CREATE EXTENSION IF NOT EXISTS pg_trgm;
-
-CREATE TABLE IF NOT EXISTS kb_collections (
-  id BIGSERIAL PRIMARY KEY,
-  name TEXT UNIQUE NOT NULL,
-  kb_type TEXT NOT NULL,
-  description TEXT,
-  embedding_dim INT NOT NULL,
-  distance TEXT NOT NULL DEFAULT 'cosine',
-  metadata JSONB DEFAULT '{{}}',
-  created_at TIMESTAMPTZ DEFAULT now()
-);
-
-CREATE TABLE IF NOT EXISTS kb_chunks (
-  id BIGSERIAL PRIMARY KEY,
-  collection_id BIGINT NOT NULL REFERENCES kb_collections(id) ON DELETE CASCADE,
-  external_id TEXT,
-  language TEXT,
-  symbol_kind TEXT,
-  is_recipe BOOLEAN DEFAULT FALSE,
-  is_config BOOLEAN DEFAULT FALSE,
-  is_example BOOLEAN DEFAULT FALSE,
-  package TEXT,
-  class_name TEXT,
-  method_name TEXT,
-  signature TEXT,
-  start_line INT,
-  end_line INT,
-  tokens INT,
-  content TEXT NOT NULL,
-  raw_code TEXT,
-  metadata JSONB DEFAULT '{{}}',
-  embedding VECTOR({dim}),
-  hash_key TEXT UNIQUE
-);
-
-CREATE INDEX IF NOT EXISTS kb_chunks_embedding_hnsw ON kb_chunks USING hnsw (embedding vector_cosine_ops);
-CREATE INDEX IF NOT EXISTS kb_chunks_content_trgm   ON kb_chunks USING gin  (content gin_trgm_ops);
-CREATE INDEX IF NOT EXISTS kb_chunks_collection     ON kb_chunks(collection_id);
-"""
-
-def insert_postgres(edges: List[UpgradeEdge],
-                    ledgers: List[VersionLedger],
-                    collection: str,
-                    embedding_dim: int):
-    import psycopg2
-    from pgvector.psycopg2 import register_vector
-    from psycopg2.extras import Json, execute_values
-
+# =============== DB =================
+def connect():
     conn = psycopg2.connect(
         host=os.getenv("PGHOST","localhost"),
         port=int(os.getenv("PGPORT","5432")),
@@ -325,88 +18,373 @@ def insert_postgres(edges: List[UpgradeEdge],
         password=os.getenv("PGPASSWORD"),
     )
     register_vector(conn)
+    return conn
+
+VER_TUPLE_SQL = r"""
+CREATE OR REPLACE FUNCTION ver_tuple(v text) RETURNS int[] AS $$
+  SELECT ARRAY[
+    COALESCE(NULLIF(regexp_replace(v, '^(\d+).*', '\1'), '')::int, 0),
+    COALESCE(NULLIF(regexp_replace(v, '^\d+\.(\d+).*', '\1'), '')::int, 0),
+    COALESCE(NULLIF(regexp_replace(v, '^\d+\.\d+\.(\d+).*', '\1'), '')::int, 0)
+  ];
+$$ LANGUAGE sql IMMUTABLE;
+"""
+
+LEDGER_VIEW_SQL = r"""
+CREATE MATERIALIZED VIEW IF NOT EXISTS kb_versions AS
+SELECT
+  (metadata->>'framework_folder')    AS framework_folder,
+  (metadata->>'group')               AS "group",
+  (metadata->>'artifact')            AS artifact,
+  (metadata->>'to_version')          AS version_to,
+  ver_tuple(metadata->>'to_version') AS vkey_to,
+  MIN(metadata->>'date')             AS first_seen_date
+FROM kb_chunks
+WHERE symbol_kind = 'upgrade'
+GROUP BY 1,2,3,4,5;
+
+CREATE INDEX IF NOT EXISTS kb_versions_idx
+  ON kb_versions(framework_folder, "group", artifact, vkey_to);
+"""
+
+# =============== Query Parsing =================
+VERSION_RE = re.compile(r"\b(\d+\.\d+\.\d+(?:[A-Za-z0-9.+\-]*)?)\b")
+LATEST_RE  = re.compile(r"\blatest\b", re.I)
+
+@dataclass
+class ParsedQuery:
+    framework_hint: Optional[str]
+    versions: List[str]          # all versions found in text
+    from_version: Optional[str]
+    to_version: Optional[str]
+    wants_latest: bool
+
+def parse_user_query(q: str) -> ParsedQuery:
+    ql = q.lower()
+    vers = VERSION_RE.findall(q)
+    wants_latest = bool(LATEST_RE.search(q))
+    # crude framework token (first non-version word ≥ 4 chars)
+    words = [w for w in re.findall(r"[A-Za-z0-9._\-]+", q) if not VERSION_RE.match(w)]
+    fw_hint = None
+    for w in words:
+        if len(w) >= 4:
+            fw_hint = w.lower(); break
+    # try to assign from/to
+    fver = tver = None
+    if len(vers) >= 2:
+        fver, tver = vers[0], vers[1]
+    elif len(vers) == 1:
+        if "from" in ql:
+            fver = vers[0]
+        elif "to" in ql:
+            tver = vers[0]
+        else:
+            fver = vers[0]  # default
+    return ParsedQuery(fw_hint, vers, fver, tver, wants_latest)
+
+# =============== Optional mapping (framework -> artifacts) =================
+def load_framework_map(path: Optional[str]) -> Dict[str, Any]:
+    if not path: return {}
+    p = Path(path)
+    try:
+        if p.suffix.lower() in (".yaml",".yml"):
+            import yaml  # type: ignore
+            return yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception as e:
+        print(f"[WARN] couldn't load map: {e}", file=sys.stderr)
+        return {}
+
+def resolve_artifacts(conn, framework_hint: Optional[str], fmap: Dict[str,Any]) -> List[Tuple[str,str,str]]:
+    """
+    Returns list of (framework_folder, group, artifact). Uses mapping if present,
+    else falls back to kb_versions by fuzzy name.
+    """
+    out: List[Tuple[str,str,str]] = []
+    if framework_hint and fmap:
+        fr = fmap.get(framework_hint) or fmap.get(framework_hint.lower())
+        if isinstance(fr, dict) and fr.get("artifacts"):
+            arts = []
+            for s in fr["artifacts"]:
+                if ":" in s:
+                    g,a = s.split(":",1); arts.append((framework_hint, g, a))
+            if arts:
+                return arts
+
+    if framework_hint:
+        with conn.cursor() as cur:
+            # fuzzy on framework_folder or artifact
+            cur.execute("""
+                SELECT framework_folder, "group", artifact, COUNT(*) AS n
+                FROM kb_versions
+                WHERE framework_folder ILIKE %s OR artifact ILIKE %s
+                GROUP BY 1,2,3
+                ORDER BY n DESC
+                LIMIT 3;
+            """, (f"%{framework_hint}%", f"%{framework_hint}%"))
+            rows = cur.fetchall()
+            out = [(r[0], r[1], r[2]) for r in rows]
+            if out: return out
+
+    # last resort: top 1 overall (helps empty hint)
     with conn.cursor() as cur:
-        cur.execute(DDL_TMPL.format(dim=embedding_dim))
-        cur.execute("INSERT INTO kb_collections(name, kb_type, embedding_dim) VALUES (%s,%s,%s) ON CONFLICT DO NOTHING",
-                    (collection, "code", embedding_dim))
-        cur.execute("SELECT id FROM kb_collections WHERE name=%s", (collection,))
-        cid = cur.fetchone()[0]
+        cur.execute("""
+            SELECT framework_folder, "group", artifact, COUNT(*) AS n
+            FROM kb_versions
+            GROUP BY 1,2,3
+            ORDER BY n DESC
+            LIMIT 1;
+        """)
+        r = cur.fetchone()
+        return [(r[0], r[1], r[2])] if r else []
 
-        rows = []
-        # Edges
-        for e in edges:
-            meta = {
-                "framework_folder": e.framework_folder,
-                "group": e.group, "artifact": e.artifact,
-                "from_version": e.from_version, "to_version": e.to_version,
-                "semver_delta": e.semver_delta,
-                "commit": e.commit, "author": e.author, "date": e.date,
-                "source_path": e.file,
-                "tags": e.tags, "keywords": e.keywords
-            }
-            hk = f"edge|{e.framework_folder}|{e.group}:{e.artifact}|{e.from_version}->{e.to_version}|{e.commit}"
-            rows.append((
-                cid, e.file, "text", e.symbol_kind, e.is_recipe, e.is_config, e.is_example,
-                None,None,None,None,None,None, 0,
-                e.content, None, Json(meta), [0.0]*embedding_dim, hk
-            ))
+# =============== Ledger + Edges =================
+def ensure_helpers(conn, refresh_ledger: bool):
+    with conn.cursor() as cur:
+        cur.execute(VER_TUPLE_SQL)
+        cur.execute(LEDGER_VIEW_SQL)
+        if refresh_ledger:
+            cur.execute("REFRESH MATERIALIZED VIEW CONCURRENTLY kb_versions;")
+    conn.commit()
 
-        # Ledgers
-        for L in ledgers:
-            meta = {
-                "framework_folder": L.framework_folder,
-                "group": L.group, "artifact": L.artifact,
-                "versions": L.versions, "latest": L.latest, "latest_date": L.latest_date,
-                "tags": L.tags, "keywords": L.keywords
-            }
-            hk = f"ledger|{L.framework_folder}|{L.group}:{L.artifact}"
-            rows.append((
-                cid, f"versions/{L.framework_folder}/{L.group}:{L.artifact}", "text",
-                L.symbol_kind, L.is_recipe, L.is_config, L.is_example,
-                None,None,None,None,None,None, 0,
-                L.content, None, Json(meta), [0.0]*embedding_dim, hk
-            ))
+def get_latest(conn, fw: str, g: str, a: str) -> Optional[str]:
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT version_to
+            FROM kb_versions
+            WHERE framework_folder=%s AND "group"=%s AND artifact=%s
+            ORDER BY vkey_to DESC
+            LIMIT 1;
+        """, (fw, g, a))
+        r = cur.fetchone()
+        return r[0] if r else None
 
-        execute_values(cur, """
-          INSERT INTO kb_chunks
-          (collection_id, external_id, language, symbol_kind, is_recipe, is_config, is_example,
-           package, class_name, method_name, signature, start_line, end_line, tokens,
-           content, raw_code, metadata, embedding, hash_key)
-          VALUES %s
-          ON CONFLICT (hash_key) DO NOTHING
-        """, rows, page_size=200)
-    conn.commit(); conn.close()
+def get_version_ledger_chunk(conn, fw: str, g: str, a: str) -> Optional[Dict[str,Any]]:
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT id, content, metadata
+            FROM kb_chunks
+            WHERE symbol_kind='version_ledger'
+              AND metadata->>'framework_folder'=%s
+              AND metadata->>'group'=%s
+              AND metadata->>'artifact'=%s
+            LIMIT 1;
+        """, (fw, g, a))
+        r = cur.fetchone()
+        if not r: return None
+        return {"id": r[0], "content": r[1], "metadata": r[2]}
 
-# ----------------- CLI -----------------
+def get_edges(conn, fw: str, g: str, a: str, from_v: str, to_v: str) -> List[Dict[str,Any]]:
+    with conn.cursor() as cur:
+        cur.execute("""
+        WITH edges AS (
+          SELECT
+            id, external_id, content,
+            metadata->>'from_version' AS from_v,
+            metadata->>'to_version'   AS to_v,
+            ver_tuple(metadata->>'from_version') AS fkey,
+            ver_tuple(metadata->>'to_version')   AS tkey,
+            metadata->>'date'         AS date
+          FROM kb_chunks
+          WHERE symbol_kind='upgrade'
+            AND metadata->>'framework_folder'=%s
+            AND metadata->>'group'=%s
+            AND metadata->>'artifact'=%s
+        )
+        SELECT id, external_id, content, from_v, to_v, date
+        FROM edges
+        WHERE fkey >= ver_tuple(%s) AND tkey <= ver_tuple(%s)
+        ORDER BY tkey ASC;
+        """, (fw, g, a, from_v, to_v))
+        rows = cur.fetchall()
+        return [{"id":r[0],"path":r[1],"content":r[2],"from":r[3],"to":r[4],"date":r[5]} for r in rows]
+
+# =============== Fallback hybrid (lexical-first; vector optional) ==============
+def hybrid_within_framework(conn,
+                            fw: str,
+                            query_text: str,
+                            versions: List[str],
+                            k: int = 6,
+                            query_vector: Optional[List[float]] = None) -> List[Dict[str,Any]]:
+    """
+    Pulls useful non-edge docs (recipes/configs) inside a framework folder.
+    Uses pg_trgm lexical similarity + small boosts; optionally blends a vector score if provided.
+    """
+    vers_arr = versions or ["__none__"]
+
+    if query_vector is None:
+        sql = """
+        WITH lex AS (
+          SELECT id, external_id, content,
+                 GREATEST(similarity(content, %s), 0) AS lscore,
+                 CASE WHEN symbol_kind='upgrade' THEN 0.10 ELSE 0 END
+               + CASE WHEN is_recipe THEN 0.10 ELSE 0 END
+               + CASE WHEN is_config THEN 0.08 ELSE 0 END
+               + CASE WHEN (metadata->'keywords') ?| %s::text[] THEN 0.08 ELSE 0 END
+               AS boost
+          FROM kb_chunks
+          WHERE metadata->>'framework_folder'=%s
+            AND content % %s
+          ORDER BY lscore DESC
+          LIMIT 200
+        )
+        SELECT id, external_id, content, (lscore + boost) AS score
+        FROM lex
+        ORDER BY score DESC
+        LIMIT %s;
+        """
+        params = (query_text, vers_arr, fw, query_text, k)
+    else:
+        # vector + lexical blend (keep counts aligned)
+        sql = """
+        WITH vec AS (
+          SELECT id, external_id, content,
+                 1 - (embedding <=> %s) AS vscore
+          FROM kb_chunks
+          WHERE metadata->>'framework_folder'=%s
+          ORDER BY embedding <=> %s
+          LIMIT 200
+        ),
+        lex AS (
+          SELECT id, external_id, content,
+                 GREATEST(similarity(content, %s), 0) AS lscore
+          FROM kb_chunks
+          WHERE metadata->>'framework_folder'=%s AND content % %s
+          ORDER BY lscore DESC
+          LIMIT 200
+        ),
+        unioned AS (
+          SELECT id, external_id, content, vscore, 0::float AS lscore FROM vec
+          UNION ALL
+          SELECT id, external_id, content, 0::float, lscore FROM lex
+        ),
+        agg AS (
+          SELECT id, ANY_VALUE(external_id) AS external_id, ANY_VALUE(content) AS content,
+                 MAX(vscore) AS vscore, MAX(lscore) AS lscore
+          FROM unioned
+          GROUP BY id
+        )
+        SELECT id, external_id, content,
+               (0.7*vscore + 0.3*lscore) AS score
+        FROM agg
+        ORDER BY score DESC
+        LIMIT %s;
+        """
+        params = (query_vector, fw, query_vector, query_text, fw, query_text, k)
+
+    with conn.cursor() as cur:
+        cur.execute(sql, params)
+        rows = cur.fetchall()
+        return [{"id":r[0], "path":r[1], "content":r[2], "score":float(r[3])} for r in rows]
+
+# =============== Context assembly (render-safe) ==============
+def wrap_text(s: str, width: int = 180) -> str:
+    paras = [p.strip("\n") for p in (s or "").split("\n\n")]
+    return "\n\n".join(textwrap.fill(p, width=width,
+                                     replace_whitespace=False,
+                                     drop_whitespace=False,
+                                     break_long_words=False,
+                                     break_on_hyphens=False) if p.strip() else ""
+                       for p in paras)
+
+def build_context_text(framework: str,
+                       group: str,
+                       artifact: str,
+                       from_v: str,
+                       to_v: str,
+                       edges: List[Dict[str,Any]],
+                       ledger_text: Optional[str],
+                       extras: List[Dict[str,Any]]) -> str:
+    head = f"Upgrade plan for {framework} — {group}:{artifact}\nFrom: {from_v}  To: {to_v}\n"
+    steps = "\n".join(f"- Bump {group}:{artifact} {e['from']} → {e['to']} ({e['path']})" for e in edges) or "- (no direct edges found)"
+    code = (
+        "```xml\n"
+        f"<!-- Example (Maven): set {artifact} to {to_v} -->\n"
+        f"<dependency>\n  <groupId>{group}</groupId>\n  <artifactId>{artifact}</artifactId>\n  <version>{to_v}</version>\n</dependency>\n"
+        "```\n"
+    )
+    extras_block = ""
+    if extras:
+        extras_block = "\nExtras (related recipes/configs):\n" + "\n".join(f"- {x['path']}" for x in extras[:5])
+    ledger_block = f"\n\nLedger:\n{wrap_text(ledger_text)}" if ledger_text else ""
+    sources = "\n".join(f"- {e['from']}→{e['to']}: {e['path']}" for e in edges)
+    body = head + "\nSteps:\n" + steps + "\n\n" + code + extras_block + ledger_block + "\n\nSources:\n" + sources
+    # keep Copilot/JetBrains stable (short code fence, wrapped lines)
+    return wrap_text(body, 180)
+
+# =============== Orchestrator =================
+@dataclass
+class RetrievalResult:
+    context: str
+    meta: Dict[str,Any]
+
+def retrieve_upgrade_context(user_query: str,
+                             map_file: Optional[str] = None,
+                             refresh_ledger: bool = False,
+                             query_vector: Optional[List[float]] = None,
+                             fallback_k: int = 6) -> RetrievalResult:
+    pq = parse_user_query(user_query)
+    conn = connect()
+    ensure_helpers(conn, refresh_ledger)
+
+    fmap = load_framework_map(map_file)
+    cand = resolve_artifacts(conn, pq.framework_hint, fmap)
+    if not cand:
+        conn.close()
+        return RetrievalResult(context=f"Couldn't infer framework/artifact from '{user_query}'.", meta={})
+
+    # Choose the first candidate; extend if you want multi-artifact support
+    framework, group, artifact = cand[0]
+
+    # Resolve from/to
+    if not pq.from_version:
+        conn.close()
+        return RetrievalResult(context="Please specify your current version (e.g., 'from 3.0.0').", meta={})
+    target = pq.to_version
+    if pq.wants_latest or not target or target.lower()=="latest":
+        latest = get_latest(conn, framework, group, artifact)
+        if not latest:
+            conn.close()
+            return RetrievalResult(context=f"No latest version found for {framework} {group}:{artifact}.", meta={})
+        target = latest
+
+    # Deterministic path via edges
+    edges = get_edges(conn, framework, group, artifact, pq.from_version, target)
+
+    # Ledger chunk (optional but nice)
+    ledger = get_version_ledger_chunk(conn, framework, group, artifact)
+    ledger_text = ledger["content"] if ledger else None
+
+    # If few/no edges, pull extras inside the framework (recipes/configs)
+    extras: List[Dict[str,Any]] = []
+    if len(edges) < 2:
+        qt = f"upgrade {artifact} {group}:{artifact} from {pq.from_version} to {target}"
+        extras = hybrid_within_framework(conn, framework, qt, versions=[pq.from_version, target],
+                                         k=fallback_k, query_vector=query_vector)
+    conn.close()
+
+    context_text = build_context_text(framework, group, artifact, pq.from_version, target, edges, ledger_text, extras)
+    meta = {
+        "framework": framework, "group": group, "artifact": artifact,
+        "from": pq.from_version, "to": target,
+        "edges": edges, "extras": [{"path":x["path"],"score":x.get("score",0)} for x in extras]
+    }
+    return RetrievalResult(context=context_text, meta=meta)
+
+# =============== CLI =================
 def main():
-    ap = argparse.ArgumentParser(description="Generate upgrade chunks from a `git log -p` file.")
-    ap.add_argument("--log-file", required=True, help="Path to file produced by `git log -p` (prefer --date=iso-strict --no-color).")
-    ap.add_argument("--base-prefix", default="frameworks/", help="Path prefix to infer the framework folder (e.g., 'frameworks/').")
-    ap.add_argument("--edges-out", default="upgrade_edges.jsonl", help="Where to write upgrade edge chunks (JSONL).")
-    ap.add_argument("--ledgers-out", default="version_ledgers.jsonl", help="Where to write version ledger chunks (JSONL).")
-    ap.add_argument("--insert", action="store_true", help="Insert both edges and ledgers into Postgres.")
-    ap.add_argument("--collection", default="code-java", help="Collection name for Postgres insert.")
-    ap.add_argument("--embedding-dim", type=int, default=1024, help="Embedding dimension for pgvector column.")
+    ap = argparse.ArgumentParser(description="Retrieve upgrade context for LLM from kb_* tables.")
+    ap.add_argument("--query", required=True, help="e.g., 'upgrade chassis to latest from 3.0.0'")
+    ap.add_argument("--map", default=None, help="YAML/JSON mapping framework-> {artifacts:[group:artifact,...]}")
+    ap.add_argument("--refresh-ledger", action="store_true", help="Refresh kb_versions view.")
+    ap.add_argument("--out", default=None, help="Write context to file.")
     args = ap.parse_args()
 
-    commits = parse_gitlog(Path(args.log_file))
-    edges = make_upgrade_edges(commits, args.base_prefix)
-    ledgers = make_ledgers(edges)
-
-    # JSONL outputs
-    with open(args.edges_out, "w", encoding="utf-8") as f:
-        for e in edges:
-            f.write(json.dumps(asdict(e), ensure_ascii=False) + "\n")
-    with open(args.ledgers_out, "w", encoding="utf-8") as f:
-        for L in ledgers:
-            f.write(json.dumps(asdict(L), ensure_ascii=False) + "\n")
-
-    print(f"[ok] commits: {len(commits)} | edges: {len(edges)} | ledgers: {len(ledgers)}")
-    print(f"[ok] wrote {args.edges_out} and {args.ledgers_out}")
-
-    if args.insert:
-        insert_postgres(edges, ledgers, args.collection, args.embedding_dim)
-        print("[ok] inserted into Postgres")
+    res = retrieve_upgrade_context(args.query, map_file=args.map, refresh_ledger=args.refresh_ledger)
+    if args.out:
+        Path(args.out).write_text(res.context, encoding="utf-8")
+        print(f"[ok] wrote {args.out}")
+    print("\n" + res.context)
 
 if __name__ == "__main__":
     main()
