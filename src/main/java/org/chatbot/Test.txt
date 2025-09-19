@@ -1,15 +1,13 @@
- #!/usr/bin/env python3
+#!/usr/bin/env python3
 from __future__ import annotations
-import argparse, json, os, re, sys, textwrap
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+import argparse, json, math, os, re, sys
+from typing import List, Tuple, Optional
 
 import psycopg2
 from pgvector.psycopg2 import register_vector
 
-# =============== DB =================
-def connect():
+# ---------- DB ----------
+def _connect():
     conn = psycopg2.connect(
         host=os.getenv("PGHOST","localhost"),
         port=int(os.getenv("PGPORT","5432")),
@@ -20,371 +18,255 @@ def connect():
     register_vector(conn)
     return conn
 
-VER_TUPLE_SQL = r"""
-CREATE OR REPLACE FUNCTION ver_tuple(v text) RETURNS int[] AS $$
-  SELECT ARRAY[
-    COALESCE(NULLIF(regexp_replace(v, '^(\d+).*', '\1'), '')::int, 0),
-    COALESCE(NULLIF(regexp_replace(v, '^\d+\.(\d+).*', '\1'), '')::int, 0),
-    COALESCE(NULLIF(regexp_replace(v, '^\d+\.\d+\.(\d+).*', '\1'), '')::int, 0)
-  ];
-$$ LANGUAGE sql IMMUTABLE;
-"""
+# ---------- helpers ----------
+def parse_embedding_string(s: Optional[str], expected_dim: int) -> Optional[List[float]]:
+    if not s: return None
+    s = s.strip()
+    if s.startswith("[") and s.endswith("]"):
+        s = s[1:-1]
+    parts = re.split(r"[,\s]+", s.strip())
+    vec = [float(x) for x in parts if x]
+    if len(vec) != expected_dim:
+        raise ValueError(f"Embedding dim {len(vec)} != expected {expected_dim}")
+    n = math.sqrt(sum(x*x for x in vec)) or 1.0
+    return [x/n for x in vec]
 
-LEDGER_VIEW_SQL = r"""
-CREATE MATERIALIZED VIEW IF NOT EXISTS kb_versions AS
-SELECT
-  (metadata->>'framework_folder')    AS framework_folder,
-  (metadata->>'group')               AS "group",
-  (metadata->>'artifact')            AS artifact,
-  (metadata->>'to_version')          AS version_to,
-  ver_tuple(metadata->>'to_version') AS vkey_to,
-  MIN(metadata->>'date')             AS first_seen_date
-FROM kb_chunks
-WHERE symbol_kind = 'upgrade'
-GROUP BY 1,2,3,4,5;
-
-CREATE INDEX IF NOT EXISTS kb_versions_idx
-  ON kb_versions(framework_folder, "group", artifact, vkey_to);
-"""
-
-# =============== Query Parsing =================
-VERSION_RE = re.compile(r"\b(\d+\.\d+\.\d+(?:[A-Za-z0-9.+\-]*)?)\b")
-LATEST_RE  = re.compile(r"\blatest\b", re.I)
-
-@dataclass
-class ParsedQuery:
-    framework_hint: Optional[str]
-    versions: List[str]          # all versions found in text
-    from_version: Optional[str]
-    to_version: Optional[str]
-    wants_latest: bool
-
-def parse_user_query(q: str) -> ParsedQuery:
+def _tags_from_query(q: str) -> List[str]:
     ql = q.lower()
-    vers = VERSION_RE.findall(q)
-    wants_latest = bool(LATEST_RE.search(q))
-    # crude framework token (first non-version word ≥ 4 chars)
-    words = [w for w in re.findall(r"[A-Za-z0-9._\-]+", q) if not VERSION_RE.match(w)]
-    fw_hint = None
-    for w in words:
-        if len(w) >= 4:
-            fw_hint = w.lower(); break
-    # try to assign from/to
-    fver = tver = None
-    if len(vers) >= 2:
-        fver, tver = vers[0], vers[1]
-    elif len(vers) == 1:
-        if "from" in ql:
-            fver = vers[0]
-        elif "to" in ql:
-            tver = vers[0]
+    tags = []
+    if re.search(r"\bupgrade|bump|migrate|version\b", ql): tags.append("upgrade")
+    if re.search(r"\blogging|logback|log4j|slf4j\b", ql): tags.append("logging")
+    if "python" in ql: tags.append("python")
+    if "java" in ql: tags.append("java")
+    if "confluence" in ql: tags.append("confluence")
+    return tags or ["__none__"]
+
+def _keyword_candidates(q: str) -> List[str]:
+    toks = re.findall(r"[a-z0-9][a-z0-9._\-]+", q.lower())
+    toks = [t for t in toks if len(t) >= 3]
+    return list(dict.fromkeys(toks))[:20] or ["__none__"]
+
+# ---------- SQL: candidate collections ----------
+# With vector (hybrid) — filters by allowed kb_types / names if provided (empty arrays mean “no filter”)
+CANDIDATE_COLLECTIONS_SQL = """
+SET pg_trgm.similarity_threshold = 0.25;
+WITH allowed AS (
+  SELECT id, name, kb_type
+  FROM kb_collections
+  WHERE (cardinality(%s::text[]) = 0 OR kb_type = ANY(%s::text[]))
+    AND (cardinality(%s::text[]) = 0 OR name = ANY(%s::text[]))
+),
+vec AS (
+  SELECT collection_id, 1 - (embedding <=> %s) AS vscore
+  FROM kb_chunks
+  WHERE collection_id IN (SELECT id FROM allowed)
+  ORDER BY embedding <=> %s
+  LIMIT 1000
+),
+lex AS (
+  SELECT collection_id, GREATEST(similarity(content, %s), 0) AS lscore
+  FROM kb_chunks
+  WHERE collection_id IN (SELECT id FROM allowed) AND content % %s
+  ORDER BY lscore DESC
+  LIMIT 1000
+),
+unioned AS (
+  SELECT collection_id, vscore, 0::float AS lscore FROM vec
+  UNION ALL
+  SELECT collection_id, 0::float, lscore FROM lex
+),
+agg AS (
+  SELECT collection_id,
+         MAX(vscore) AS vscore,
+         MAX(lscore) AS lscore,
+         (0.7*MAX(vscore) + 0.3*MAX(lscore)) AS fused
+  FROM unioned
+  GROUP BY collection_id
+)
+SELECT c.id, c.name, c.kb_type, a.fused
+FROM agg a JOIN kb_collections c ON c.id=a.collection_id
+ORDER BY a.fused DESC
+LIMIT %s;
+"""
+
+# Lexical-only fallback (no embedding provided)
+CANDIDATE_COLLECTIONS_LEX_SQL = """
+SET pg_trgm.similarity_threshold = 0.25;
+WITH allowed AS (
+  SELECT id, name, kb_type
+  FROM kb_collections
+  WHERE (cardinality(%s::text[]) = 0 OR kb_type = ANY(%s::text[]))
+    AND (cardinality(%s::text[]) = 0 OR name = ANY(%s::text[]))
+),
+lex AS (
+  SELECT collection_id, GREATEST(similarity(content, %s), 0) AS lscore
+  FROM kb_chunks
+  WHERE collection_id IN (SELECT id FROM allowed) AND content % %s
+  ORDER BY lscore DESC
+  LIMIT 2000
+),
+agg AS (
+  SELECT collection_id, MAX(lscore) AS lscore
+  FROM lex
+  GROUP BY collection_id
+)
+SELECT c.id, c.name, c.kb_type, a.lscore AS fused
+FROM agg a JOIN kb_collections c ON c.id=a.collection_id
+ORDER BY fused DESC
+LIMIT %s;
+"""
+
+# ---------- SQL: retrieve within selected collections (hybrid with boosts) ----------
+HYBRID_WITHIN_SQL = """
+WITH vec AS (
+  SELECT id, 1 - (embedding <=> %s) AS vscore
+  FROM kb_chunks
+  WHERE collection_id = ANY(%s::bigint[])
+  ORDER BY embedding <=> %s
+  LIMIT 200
+),
+lex AS (
+  SET pg_trgm.similarity_threshold = 0.25;
+  SELECT id, GREATEST(similarity(content, %s), 0) AS lscore
+  FROM kb_chunks
+  WHERE collection_id = ANY(%s::bigint[]) AND content % %s
+  ORDER BY lscore DESC
+  LIMIT 200
+),
+unioned AS (
+  SELECT id, vscore, 0::float AS lscore FROM vec
+  UNION ALL
+  SELECT id, 0::float, lscore FROM lex
+),
+agg AS (
+  SELECT id,
+         MAX(vscore) AS vscore,
+         MAX(lscore) AS lscore,
+         (0.7*MAX(vscore) + 0.3*MAX(lscore)
+          + 0.08*MAX(CASE WHEN jsonb_exists_any(kb_chunks.metadata->'tags', %s::text[]) THEN 1 ELSE 0 END)
+          + 0.05*MAX(CASE WHEN (kb_chunks.metadata->'keywords') ?| %s::text[] THEN 1 ELSE 0 END)
+          + 0.04*AVG(COALESCE( (kb_chunks.metadata->>'folder_boost')::float, 0))
+         ) AS fused
+  FROM unioned
+  JOIN kb_chunks USING (id)
+  GROUP BY id
+)
+SELECT c.id, c.collection_id, c.external_id, c.symbol_kind,
+       a.vscore, a.lscore, a.fused, c.content
+FROM agg a
+JOIN kb_chunks c USING (id)
+ORDER BY a.fused DESC
+LIMIT %s;
+"""
+
+VEC_ONLY_WITHIN_SQL = """
+SELECT id, collection_id, external_id, symbol_kind,
+       1 - (embedding <=> %s) AS vscore, content
+FROM kb_chunks
+WHERE collection_id = ANY(%s::bigint[])
+ORDER BY embedding <=> %s
+LIMIT %s;
+"""
+
+# ---------- core ----------
+def pick_collections(conn, query: str, qvec: Optional[List[float]],
+                     allow_types: List[str], allow_names: List[str],
+                     top_collections: int) -> List[Tuple[int,str,str,float]]:
+    allow_types = allow_types or []
+    allow_names = allow_names or []
+    with conn.cursor() as cur:
+        if qvec is not None:
+            params = (allow_types, allow_types, allow_names, allow_names, qvec, qvec, query, query, top_collections)
+            cur.execute(CANDIDATE_COLLECTIONS_SQL, params)
         else:
-            fver = vers[0]  # default
-    return ParsedQuery(fw_hint, vers, fver, tver, wants_latest)
+            params = (allow_types, allow_types, allow_names, allow_names, query, query, top_collections)
+            cur.execute(CANDIDATE_COLLECTIONS_LEX_SQL, params)
+        return [(r[0], r[1], r[2], float(r[3])) for r in cur.fetchall()]
 
-# =============== Optional mapping (framework -> artifacts) =================
-def load_framework_map(path: Optional[str]) -> Dict[str, Any]:
-    if not path: return {}
-    p = Path(path)
-    try:
-        if p.suffix.lower() in (".yaml",".yml"):
-            import yaml  # type: ignore
-            return yaml.safe_load(p.read_text(encoding="utf-8")) or {}
-        return json.loads(p.read_text(encoding="utf-8"))
-    except Exception as e:
-        print(f"[WARN] couldn't load map: {e}", file=sys.stderr)
-        return {}
-
-def resolve_artifacts(conn, framework_hint: Optional[str], fmap: Dict[str,Any]) -> List[Tuple[str,str,str]]:
-    """
-    Returns list of (framework_folder, group, artifact). Uses mapping if present,
-    else falls back to kb_versions by fuzzy name.
-    """
-    out: List[Tuple[str,str,str]] = []
-    if framework_hint and fmap:
-        fr = fmap.get(framework_hint) or fmap.get(framework_hint.lower())
-        if isinstance(fr, dict) and fr.get("artifacts"):
-            arts = []
-            for s in fr["artifacts"]:
-                if ":" in s:
-                    g,a = s.split(":",1); arts.append((framework_hint, g, a))
-            if arts:
-                return arts
-
-    if framework_hint:
+def retrieve_within(conn, query: str, qvec: Optional[List[float]],
+                    collection_ids: List[int], k: int) -> List[tuple]:
+    if not collection_ids: return []
+    if qvec is not None:
+        tags = _tags_from_query(query)
+        keys = _keyword_candidates(query)
+        params = (qvec, collection_ids, qvec, query, collection_ids, query, tags, keys, k)
         with conn.cursor() as cur:
-            # fuzzy on framework_folder or artifact
-            cur.execute("""
-                SELECT framework_folder, "group", artifact, COUNT(*) AS n
-                FROM kb_versions
-                WHERE framework_folder ILIKE %s OR artifact ILIKE %s
-                GROUP BY 1,2,3
-                ORDER BY n DESC
-                LIMIT 3;
-            """, (f"%{framework_hint}%", f"%{framework_hint}%"))
-            rows = cur.fetchall()
-            out = [(r[0], r[1], r[2]) for r in rows]
-            if out: return out
-
-    # last resort: top 1 overall (helps empty hint)
-    with conn.cursor() as cur:
-        cur.execute("""
-            SELECT framework_folder, "group", artifact, COUNT(*) AS n
-            FROM kb_versions
-            GROUP BY 1,2,3
-            ORDER BY n DESC
-            LIMIT 1;
-        """)
-        r = cur.fetchone()
-        return [(r[0], r[1], r[2])] if r else []
-
-# =============== Ledger + Edges =================
-def ensure_helpers(conn, refresh_ledger: bool):
-    with conn.cursor() as cur:
-        cur.execute(VER_TUPLE_SQL)
-        cur.execute(LEDGER_VIEW_SQL)
-        if refresh_ledger:
-            cur.execute("REFRESH MATERIALIZED VIEW CONCURRENTLY kb_versions;")
-    conn.commit()
-
-def get_latest(conn, fw: str, g: str, a: str) -> Optional[str]:
-    with conn.cursor() as cur:
-        cur.execute("""
-            SELECT version_to
-            FROM kb_versions
-            WHERE framework_folder=%s AND "group"=%s AND artifact=%s
-            ORDER BY vkey_to DESC
-            LIMIT 1;
-        """, (fw, g, a))
-        r = cur.fetchone()
-        return r[0] if r else None
-
-def get_version_ledger_chunk(conn, fw: str, g: str, a: str) -> Optional[Dict[str,Any]]:
-    with conn.cursor() as cur:
-        cur.execute("""
-            SELECT id, content, metadata
-            FROM kb_chunks
-            WHERE symbol_kind='version_ledger'
-              AND metadata->>'framework_folder'=%s
-              AND metadata->>'group'=%s
-              AND metadata->>'artifact'=%s
-            LIMIT 1;
-        """, (fw, g, a))
-        r = cur.fetchone()
-        if not r: return None
-        return {"id": r[0], "content": r[1], "metadata": r[2]}
-
-def get_edges(conn, fw: str, g: str, a: str, from_v: str, to_v: str) -> List[Dict[str,Any]]:
-    with conn.cursor() as cur:
-        cur.execute("""
-        WITH edges AS (
-          SELECT
-            id, external_id, content,
-            metadata->>'from_version' AS from_v,
-            metadata->>'to_version'   AS to_v,
-            ver_tuple(metadata->>'from_version') AS fkey,
-            ver_tuple(metadata->>'to_version')   AS tkey,
-            metadata->>'date'         AS date
-          FROM kb_chunks
-          WHERE symbol_kind='upgrade'
-            AND metadata->>'framework_folder'=%s
-            AND metadata->>'group'=%s
-            AND metadata->>'artifact'=%s
-        )
-        SELECT id, external_id, content, from_v, to_v, date
-        FROM edges
-        WHERE fkey >= ver_tuple(%s) AND tkey <= ver_tuple(%s)
-        ORDER BY tkey ASC;
-        """, (fw, g, a, from_v, to_v))
-        rows = cur.fetchall()
-        return [{"id":r[0],"path":r[1],"content":r[2],"from":r[3],"to":r[4],"date":r[5]} for r in rows]
-
-# =============== Fallback hybrid (lexical-first; vector optional) ==============
-def hybrid_within_framework(conn,
-                            fw: str,
-                            query_text: str,
-                            versions: List[str],
-                            k: int = 6,
-                            query_vector: Optional[List[float]] = None) -> List[Dict[str,Any]]:
-    """
-    Pulls useful non-edge docs (recipes/configs) inside a framework folder.
-    Uses pg_trgm lexical similarity + small boosts; optionally blends a vector score if provided.
-    """
-    vers_arr = versions or ["__none__"]
-
-    if query_vector is None:
-        sql = """
-        WITH lex AS (
-          SELECT id, external_id, content,
-                 GREATEST(similarity(content, %s), 0) AS lscore,
-                 CASE WHEN symbol_kind='upgrade' THEN 0.10 ELSE 0 END
-               + CASE WHEN is_recipe THEN 0.10 ELSE 0 END
-               + CASE WHEN is_config THEN 0.08 ELSE 0 END
-               + CASE WHEN (metadata->'keywords') ?| %s::text[] THEN 0.08 ELSE 0 END
-               AS boost
-          FROM kb_chunks
-          WHERE metadata->>'framework_folder'=%s
-            AND content % %s
-          ORDER BY lscore DESC
-          LIMIT 200
-        )
-        SELECT id, external_id, content, (lscore + boost) AS score
-        FROM lex
-        ORDER BY score DESC
-        LIMIT %s;
-        """
-        params = (query_text, vers_arr, fw, query_text, k)
+            cur.execute(HYBRID_WITHIN_SQL, params)
+            return cur.fetchall()
     else:
-        # vector + lexical blend (keep counts aligned)
-        sql = """
-        WITH vec AS (
-          SELECT id, external_id, content,
-                 1 - (embedding <=> %s) AS vscore
-          FROM kb_chunks
-          WHERE metadata->>'framework_folder'=%s
-          ORDER BY embedding <=> %s
-          LIMIT 200
-        ),
-        lex AS (
-          SELECT id, external_id, content,
-                 GREATEST(similarity(content, %s), 0) AS lscore
-          FROM kb_chunks
-          WHERE metadata->>'framework_folder'=%s AND content % %s
-          ORDER BY lscore DESC
-          LIMIT 200
-        ),
-        unioned AS (
-          SELECT id, external_id, content, vscore, 0::float AS lscore FROM vec
-          UNION ALL
-          SELECT id, external_id, content, 0::float, lscore FROM lex
-        ),
-        agg AS (
-          SELECT id, ANY_VALUE(external_id) AS external_id, ANY_VALUE(content) AS content,
-                 MAX(vscore) AS vscore, MAX(lscore) AS lscore
-          FROM unioned
-          GROUP BY id
-        )
-        SELECT id, external_id, content,
-               (0.7*vscore + 0.3*lscore) AS score
-        FROM agg
-        ORDER BY score DESC
-        LIMIT %s;
-        """
-        params = (query_vector, fw, query_vector, query_text, fw, query_text, k)
+        params = (query, collection_ids, query, k)  # use lexical-only by swapping to vec-only? Here we do trigram-only by cheating via vector-less path
+        # Simpler: still use lex path, emulate with HYBRID via zero vec? We'll just do lex-only quick query:
+        with conn.cursor() as cur:
+            cur.execute("SET pg_trgm.similarity_threshold = 0.25;")
+            cur.execute("""
+              SELECT id, collection_id, external_id, symbol_kind,
+                     GREATEST(similarity(content, %s),0) AS lscore, content
+              FROM kb_chunks
+              WHERE collection_id = ANY(%s::bigint[])
+                AND content % %s
+              ORDER BY lscore DESC
+              LIMIT %s;
+            """, params)
+            return cur.fetchall()
 
-    with conn.cursor() as cur:
-        cur.execute(sql, params)
-        rows = cur.fetchall()
-        return [{"id":r[0], "path":r[1], "content":r[2], "score":float(r[3])} for r in rows]
+def build_context(rows: List[tuple], collections_meta: List[Tuple[int,str,str,float]], query: str) -> str:
+    # Group by collection for a tidy context
+    by_coll: dict[int, List[tuple]] = {}
+    for r in rows:
+        coll_id = r[1] if len(r) >= 2 else None
+        by_coll.setdefault(coll_id, []).append(r)
 
-# =============== Context assembly (render-safe) ==============
-def wrap_text(s: str, width: int = 180) -> str:
-    paras = [p.strip("\n") for p in (s or "").split("\n\n")]
-    return "\n\n".join(textwrap.fill(p, width=width,
-                                     replace_whitespace=False,
-                                     drop_whitespace=False,
-                                     break_long_words=False,
-                                     break_on_hyphens=False) if p.strip() else ""
-                       for p in paras)
+    name_map = {cid: (name, kbt, score) for cid, name, kbt, score in collections_meta}
+    parts = [f"Query: {query}\n"]
 
-def build_context_text(framework: str,
-                       group: str,
-                       artifact: str,
-                       from_v: str,
-                       to_v: str,
-                       edges: List[Dict[str,Any]],
-                       ledger_text: Optional[str],
-                       extras: List[Dict[str,Any]]) -> str:
-    head = f"Upgrade plan for {framework} — {group}:{artifact}\nFrom: {from_v}  To: {to_v}\n"
-    steps = "\n".join(f"- Bump {group}:{artifact} {e['from']} → {e['to']} ({e['path']})" for e in edges) or "- (no direct edges found)"
-    code = (
-        "```xml\n"
-        f"<!-- Example (Maven): set {artifact} to {to_v} -->\n"
-        f"<dependency>\n  <groupId>{group}</groupId>\n  <artifactId>{artifact}</artifactId>\n  <version>{to_v}</version>\n</dependency>\n"
-        "```\n"
-    )
-    extras_block = ""
-    if extras:
-        extras_block = "\nExtras (related recipes/configs):\n" + "\n".join(f"- {x['path']}" for x in extras[:5])
-    ledger_block = f"\n\nLedger:\n{wrap_text(ledger_text)}" if ledger_text else ""
-    sources = "\n".join(f"- {e['from']}→{e['to']}: {e['path']}" for e in edges)
-    body = head + "\nSteps:\n" + steps + "\n\n" + code + extras_block + ledger_block + "\n\nSources:\n" + sources
-    # keep Copilot/JetBrains stable (short code fence, wrapped lines)
-    return wrap_text(body, 180)
+    for cid, items in by_coll.items():
+        name, kbt, cscore = name_map.get(cid, (f"collection:{cid}", "unknown", 0.0))
+        parts.append(f"== Collection: {name}  (type={kbt}, routed_score={cscore:.3f}) ==")
+        for r in items[:5]:
+            if len(r) == 8:  # hybrid shape
+                _id, _coll, ext, kind, v, l, f, content = r
+                parts.append(f"- [{kind or 'doc'}] {ext}  (score={f:.3f})")
+                # include a tiny excerpt
+                snippet = "\n".join((content or "").splitlines()[:30])
+                parts.append(snippet)
+                parts.append("")
+            else:            # lexical-only fallback shape
+                _id, _coll, ext, kind, s, content = r
+                parts.append(f"- [{kind or 'doc'}] {ext}  (score={float(s):.3f})")
+                snippet = "\n".join((content or "").splitlines()[:30])
+                parts.append(snippet)
+                parts.append("")
+    return "\n".join(parts).strip()
 
-# =============== Orchestrator =================
-@dataclass
-class RetrievalResult:
-    context: str
-    meta: Dict[str,Any]
-
-def retrieve_upgrade_context(user_query: str,
-                             map_file: Optional[str] = None,
-                             refresh_ledger: bool = False,
-                             query_vector: Optional[List[float]] = None,
-                             fallback_k: int = 6) -> RetrievalResult:
-    pq = parse_user_query(user_query)
-    conn = connect()
-    ensure_helpers(conn, refresh_ledger)
-
-    fmap = load_framework_map(map_file)
-    cand = resolve_artifacts(conn, pq.framework_hint, fmap)
-    if not cand:
-        conn.close()
-        return RetrievalResult(context=f"Couldn't infer framework/artifact from '{user_query}'.", meta={})
-
-    # Choose the first candidate; extend if you want multi-artifact support
-    framework, group, artifact = cand[0]
-
-    # Resolve from/to
-    if not pq.from_version:
-        conn.close()
-        return RetrievalResult(context="Please specify your current version (e.g., 'from 3.0.0').", meta={})
-    target = pq.to_version
-    if pq.wants_latest or not target or target.lower()=="latest":
-        latest = get_latest(conn, framework, group, artifact)
-        if not latest:
-            conn.close()
-            return RetrievalResult(context=f"No latest version found for {framework} {group}:{artifact}.", meta={})
-        target = latest
-
-    # Deterministic path via edges
-    edges = get_edges(conn, framework, group, artifact, pq.from_version, target)
-
-    # Ledger chunk (optional but nice)
-    ledger = get_version_ledger_chunk(conn, framework, group, artifact)
-    ledger_text = ledger["content"] if ledger else None
-
-    # If few/no edges, pull extras inside the framework (recipes/configs)
-    extras: List[Dict[str,Any]] = []
-    if len(edges) < 2:
-        qt = f"upgrade {artifact} {group}:{artifact} from {pq.from_version} to {target}"
-        extras = hybrid_within_framework(conn, framework, qt, versions=[pq.from_version, target],
-                                         k=fallback_k, query_vector=query_vector)
-    conn.close()
-
-    context_text = build_context_text(framework, group, artifact, pq.from_version, target, edges, ledger_text, extras)
-    meta = {
-        "framework": framework, "group": group, "artifact": artifact,
-        "from": pq.from_version, "to": target,
-        "edges": edges, "extras": [{"path":x["path"],"score":x.get("score",0)} for x in extras]
-    }
-    return RetrievalResult(context=context_text, meta=meta)
-
-# =============== CLI =================
+# ---------- CLI ----------
 def main():
-    ap = argparse.ArgumentParser(description="Retrieve upgrade context for LLM from kb_* tables.")
-    ap.add_argument("--query", required=True, help="e.g., 'upgrade chassis to latest from 3.0.0'")
-    ap.add_argument("--map", default=None, help="YAML/JSON mapping framework-> {artifacts:[group:artifact,...]}")
-    ap.add_argument("--refresh-ledger", action="store_true", help="Refresh kb_versions view.")
-    ap.add_argument("--out", default=None, help="Write context to file.")
+    ap = argparse.ArgumentParser(description="Auto-route across multiple collections and retrieve LLM context.")
+    ap.add_argument("--query", required=True, help="Natural query, e.g., 'upgrade chassis to latest from 3.0.0'")
+    ap.add_argument("--embedding", default=None, help="Query embedding as JSON/CSV string (optional).")
+    ap.add_argument("--embedding-dim", type=int, default=1024)
+    ap.add_argument("--top-collections", type=int, default=3)
+    ap.add_argument("--k", type=int, default=12)
+    ap.add_argument("--allow-types", default="", help="Comma-separated kb_types to include (optional).")
+    ap.add_argument("--allow-names", default="", help="Comma-separated collection names to include (optional).")
     args = ap.parse_args()
 
-    res = retrieve_upgrade_context(args.query, map_file=args.map, refresh_ledger=args.refresh_ledger)
-    if args.out:
-        Path(args.out).write_text(res.context, encoding="utf-8")
-        print(f"[ok] wrote {args.out}")
-    print("\n" + res.context)
+    qvec = parse_embedding_string(args.embedding, args.embedding_dim) if args.embedding else None
+    allow_types = [s.strip() for s in args.allow_types.split(",") if s.strip()]
+    allow_names = [s.strip() for s in args.allow_names.split(",") if s.strip()]
+
+    conn = _connect()
+    try:
+        colls = pick_collections(conn, args.query, qvec, allow_types, allow_names, args.top_collections)
+        if not colls:
+            print("No candidate collections found.")
+            return
+        ids = [c[0] for c in colls]
+        rows = retrieve_within(conn, args.query, qvec, ids, args.k)
+        context = build_context(rows, colls, args.query)
+        print(context)
+        print("\n[auto] candidate collections:", " | ".join(f"{cid}:{name}({kbt})" for cid,name,kbt,_ in colls))
+    finally:
+        conn.close()
 
 if __name__ == "__main__":
     main()
