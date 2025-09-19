@@ -1,13 +1,77 @@
 #!/usr/bin/env python3
+"""
+kb_ingest.py  —  Create kb_* tables, upsert collection, insert chunks (idempotent)
+
+Requires:
+  pip install psycopg2-binary pgvector
+
+Env:
+  PGHOST, PGPORT, PGDATABASE, PGUSER, PGPASSWORD
+
+Usage examples:
+
+  # 1) Quick smoke test (demo rows; zeros embeddings)
+  python kb_ingest.py \
+    --collection-name code-java --kb-type code --embedding-dim 1024 --demo
+
+  # 2) Insert from JSONL (one JSON object per line)
+  python kb_ingest.py \
+    --collection-name git-log --kb-type git_log --embedding-dim 1024 \
+    --input-jsonl /path/to/edges_and_ledgers.jsonl
+"""
+
 from __future__ import annotations
-import argparse, json, math, os, re, sys
-from typing import List, Tuple, Optional
+import argparse, json, os, re, sys, hashlib
+from typing import Any, Dict, List, Optional
 
 import psycopg2
 from pgvector.psycopg2 import register_vector
+from psycopg2.extras import Json, execute_values
 
-# ---------- DB ----------
-def _connect():
+DDL = """
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+
+CREATE TABLE IF NOT EXISTS kb_collections (
+  id BIGSERIAL PRIMARY KEY,
+  name TEXT UNIQUE NOT NULL,
+  kb_type TEXT NOT NULL,                -- e.g. 'code', 'git_log', 'confluence'
+  description TEXT,
+  embedding_dim INT NOT NULL,
+  distance TEXT NOT NULL DEFAULT 'cosine',
+  metadata JSONB DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS kb_chunks (
+  id BIGSERIAL PRIMARY KEY,
+  collection_id BIGINT NOT NULL REFERENCES kb_collections(id) ON DELETE CASCADE,
+  external_id TEXT,
+  language TEXT,
+  symbol_kind TEXT,                     -- 'code','config','upgrade','version_ledger',...
+  is_recipe BOOLEAN DEFAULT FALSE,
+  is_config BOOLEAN DEFAULT FALSE,
+  is_example BOOLEAN DEFAULT FALSE,
+  package TEXT,
+  class_name TEXT,
+  method_name TEXT,
+  signature TEXT,
+  start_line INT,
+  end_line INT,
+  tokens INT,
+  content TEXT NOT NULL,                -- what you search over
+  raw_code TEXT,                        -- optional full code
+  metadata JSONB DEFAULT '{}'::jsonb,   -- your tags/keywords/etc.
+  embedding VECTOR(%(dim)s),
+  hash_key TEXT UNIQUE                  -- for idempotent upserts
+);
+
+CREATE INDEX IF NOT EXISTS kb_chunks_embedding_hnsw ON kb_chunks USING hnsw (embedding vector_cosine_ops);
+CREATE INDEX IF NOT EXISTS kb_chunks_content_trgm   ON kb_chunks USING gin  (content gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS kb_chunks_collection     ON kb_chunks(collection_id);
+"""
+
+def connect():
     conn = psycopg2.connect(
         host=os.getenv("PGHOST","localhost"),
         port=int(os.getenv("PGPORT","5432")),
@@ -18,253 +82,199 @@ def _connect():
     register_vector(conn)
     return conn
 
-# ---------- helpers ----------
-def parse_embedding_string(s: Optional[str], expected_dim: int) -> Optional[List[float]]:
-    if not s: return None
-    s = s.strip()
-    if s.startswith("[") and s.endswith("]"):
-        s = s[1:-1]
-    parts = re.split(r"[,\s]+", s.strip())
-    vec = [float(x) for x in parts if x]
-    if len(vec) != expected_dim:
-        raise ValueError(f"Embedding dim {len(vec)} != expected {expected_dim}")
-    n = math.sqrt(sum(x*x for x in vec)) or 1.0
-    return [x/n for x in vec]
-
-def _tags_from_query(q: str) -> List[str]:
-    ql = q.lower()
-    tags = []
-    if re.search(r"\bupgrade|bump|migrate|version\b", ql): tags.append("upgrade")
-    if re.search(r"\blogging|logback|log4j|slf4j\b", ql): tags.append("logging")
-    if "python" in ql: tags.append("python")
-    if "java" in ql: tags.append("java")
-    if "confluence" in ql: tags.append("confluence")
-    return tags or ["__none__"]
-
-def _keyword_candidates(q: str) -> List[str]:
-    toks = re.findall(r"[a-z0-9][a-z0-9._\-]+", q.lower())
-    toks = [t for t in toks if len(t) >= 3]
-    return list(dict.fromkeys(toks))[:20] or ["__none__"]
-
-# ---------- SQL: candidate collections ----------
-# With vector (hybrid) — filters by allowed kb_types / names if provided (empty arrays mean “no filter”)
-CANDIDATE_COLLECTIONS_SQL = """
-SET pg_trgm.similarity_threshold = 0.25;
-WITH allowed AS (
-  SELECT id, name, kb_type
-  FROM kb_collections
-  WHERE (cardinality(%s::text[]) = 0 OR kb_type = ANY(%s::text[]))
-    AND (cardinality(%s::text[]) = 0 OR name = ANY(%s::text[]))
-),
-vec AS (
-  SELECT collection_id, 1 - (embedding <=> %s) AS vscore
-  FROM kb_chunks
-  WHERE collection_id IN (SELECT id FROM allowed)
-  ORDER BY embedding <=> %s
-  LIMIT 1000
-),
-lex AS (
-  SELECT collection_id, GREATEST(similarity(content, %s), 0) AS lscore
-  FROM kb_chunks
-  WHERE collection_id IN (SELECT id FROM allowed) AND content % %s
-  ORDER BY lscore DESC
-  LIMIT 1000
-),
-unioned AS (
-  SELECT collection_id, vscore, 0::float AS lscore FROM vec
-  UNION ALL
-  SELECT collection_id, 0::float, lscore FROM lex
-),
-agg AS (
-  SELECT collection_id,
-         MAX(vscore) AS vscore,
-         MAX(lscore) AS lscore,
-         (0.7*MAX(vscore) + 0.3*MAX(lscore)) AS fused
-  FROM unioned
-  GROUP BY collection_id
-)
-SELECT c.id, c.name, c.kb_type, a.fused
-FROM agg a JOIN kb_collections c ON c.id=a.collection_id
-ORDER BY a.fused DESC
-LIMIT %s;
-"""
-
-# Lexical-only fallback (no embedding provided)
-CANDIDATE_COLLECTIONS_LEX_SQL = """
-SET pg_trgm.similarity_threshold = 0.25;
-WITH allowed AS (
-  SELECT id, name, kb_type
-  FROM kb_collections
-  WHERE (cardinality(%s::text[]) = 0 OR kb_type = ANY(%s::text[]))
-    AND (cardinality(%s::text[]) = 0 OR name = ANY(%s::text[]))
-),
-lex AS (
-  SELECT collection_id, GREATEST(similarity(content, %s), 0) AS lscore
-  FROM kb_chunks
-  WHERE collection_id IN (SELECT id FROM allowed) AND content % %s
-  ORDER BY lscore DESC
-  LIMIT 2000
-),
-agg AS (
-  SELECT collection_id, MAX(lscore) AS lscore
-  FROM lex
-  GROUP BY collection_id
-)
-SELECT c.id, c.name, c.kb_type, a.lscore AS fused
-FROM agg a JOIN kb_collections c ON c.id=a.collection_id
-ORDER BY fused DESC
-LIMIT %s;
-"""
-
-# ---------- SQL: retrieve within selected collections (hybrid with boosts) ----------
-HYBRID_WITHIN_SQL = """
-WITH vec AS (
-  SELECT id, 1 - (embedding <=> %s) AS vscore
-  FROM kb_chunks
-  WHERE collection_id = ANY(%s::bigint[])
-  ORDER BY embedding <=> %s
-  LIMIT 200
-),
-lex AS (
-  SET pg_trgm.similarity_threshold = 0.25;
-  SELECT id, GREATEST(similarity(content, %s), 0) AS lscore
-  FROM kb_chunks
-  WHERE collection_id = ANY(%s::bigint[]) AND content % %s
-  ORDER BY lscore DESC
-  LIMIT 200
-),
-unioned AS (
-  SELECT id, vscore, 0::float AS lscore FROM vec
-  UNION ALL
-  SELECT id, 0::float, lscore FROM lex
-),
-agg AS (
-  SELECT id,
-         MAX(vscore) AS vscore,
-         MAX(lscore) AS lscore,
-         (0.7*MAX(vscore) + 0.3*MAX(lscore)
-          + 0.08*MAX(CASE WHEN jsonb_exists_any(kb_chunks.metadata->'tags', %s::text[]) THEN 1 ELSE 0 END)
-          + 0.05*MAX(CASE WHEN (kb_chunks.metadata->'keywords') ?| %s::text[] THEN 1 ELSE 0 END)
-          + 0.04*AVG(COALESCE( (kb_chunks.metadata->>'folder_boost')::float, 0))
-         ) AS fused
-  FROM unioned
-  JOIN kb_chunks USING (id)
-  GROUP BY id
-)
-SELECT c.id, c.collection_id, c.external_id, c.symbol_kind,
-       a.vscore, a.lscore, a.fused, c.content
-FROM agg a
-JOIN kb_chunks c USING (id)
-ORDER BY a.fused DESC
-LIMIT %s;
-"""
-
-VEC_ONLY_WITHIN_SQL = """
-SELECT id, collection_id, external_id, symbol_kind,
-       1 - (embedding <=> %s) AS vscore, content
-FROM kb_chunks
-WHERE collection_id = ANY(%s::bigint[])
-ORDER BY embedding <=> %s
-LIMIT %s;
-"""
-
-# ---------- core ----------
-def pick_collections(conn, query: str, qvec: Optional[List[float]],
-                     allow_types: List[str], allow_names: List[str],
-                     top_collections: int) -> List[Tuple[int,str,str,float]]:
-    allow_types = allow_types or []
-    allow_names = allow_names or []
+def ensure_schema(conn, embedding_dim: int):
     with conn.cursor() as cur:
-        if qvec is not None:
-            params = (allow_types, allow_types, allow_names, allow_names, qvec, qvec, query, query, top_collections)
-            cur.execute(CANDIDATE_COLLECTIONS_SQL, params)
-        else:
-            params = (allow_types, allow_types, allow_names, allow_names, query, query, top_collections)
-            cur.execute(CANDIDATE_COLLECTIONS_LEX_SQL, params)
-        return [(r[0], r[1], r[2], float(r[3])) for r in cur.fetchall()]
+        cur.execute(DDL, {"dim": embedding_dim})
+    conn.commit()
 
-def retrieve_within(conn, query: str, qvec: Optional[List[float]],
-                    collection_ids: List[int], k: int) -> List[tuple]:
-    if not collection_ids: return []
-    if qvec is not None:
-        tags = _tags_from_query(query)
-        keys = _keyword_candidates(query)
-        params = (qvec, collection_ids, qvec, query, collection_ids, query, tags, keys, k)
-        with conn.cursor() as cur:
-            cur.execute(HYBRID_WITHIN_SQL, params)
-            return cur.fetchall()
+def ensure_collection(conn, *, name: str, kb_type: str, embedding_dim: int,
+                      description: Optional[str] = None,
+                      metadata: Optional[Dict[str, Any]] = None) -> int:
+    metadata = metadata or {}
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO kb_collections(name, kb_type, description, embedding_dim, metadata)
+            VALUES (%s,%s,%s,%s,%s)
+            ON CONFLICT (name) DO NOTHING;
+        """, (name, kb_type, description, embedding_dim, Json(metadata)))
+        cur.execute("SELECT id, embedding_dim FROM kb_collections WHERE name=%s", (name,))
+        row = cur.fetchone()
+        if not row:
+            raise RuntimeError("Failed to read/create collection")
+        cid, dim = row
+        if dim != embedding_dim:
+            raise ValueError(f"Collection '{name}' embedding_dim={dim} != expected {embedding_dim}. "
+                             f"Use a new collection or re-create with the desired dimension.")
+        return cid
+
+def _hash_key_for_row(collection_id: int, r: Dict[str, Any]) -> str:
+    # Stable hash: collection + external_id + symbol_kind + versions/commit + first 128 chars of content
+    md = r.get("metadata") or {}
+    fields = [
+        str(collection_id),
+        r.get("external_id") or "",
+        r.get("symbol_kind") or "",
+        md.get("commit",""),
+        (md.get("from_version","") + "->" + md.get("to_version","")) if (md.get("from_version") or md.get("to_version")) else "",
+        (r.get("content") or "")[:128],
+    ]
+    return hashlib.sha256("|".join(fields).encode("utf-8")).hexdigest()
+
+def _normalize_embedding(v: Optional[Any], dim: int) -> List[float]:
+    if v is None:
+        return [0.0]*dim
+    if isinstance(v, str):
+        s = v.strip()
+        if s.startswith("[") and s.endswith("]"):
+            s = s[1:-1]
+        parts = re.split(r"[,\s]+", s)
+        vec = [float(x) for x in parts if x != ""]
+    elif isinstance(v, (list, tuple)):
+        vec = [float(x) for x in v]
     else:
-        params = (query, collection_ids, query, k)  # use lexical-only by swapping to vec-only? Here we do trigram-only by cheating via vector-less path
-        # Simpler: still use lex path, emulate with HYBRID via zero vec? We'll just do lex-only quick query:
-        with conn.cursor() as cur:
-            cur.execute("SET pg_trgm.similarity_threshold = 0.25;")
-            cur.execute("""
-              SELECT id, collection_id, external_id, symbol_kind,
-                     GREATEST(similarity(content, %s),0) AS lscore, content
-              FROM kb_chunks
-              WHERE collection_id = ANY(%s::bigint[])
-                AND content % %s
-              ORDER BY lscore DESC
-              LIMIT %s;
-            """, params)
-            return cur.fetchall()
+        raise ValueError("embedding must be list/tuple or string")
+    if len(vec) != dim:
+        raise ValueError(f"Embedding length {len(vec)} != {dim}")
+    # (Optional) L2-normalize — depends on how your retrieval expects vectors
+    # Here we keep as-is; uncomment to normalize:
+    # import math
+    # n = math.sqrt(sum(x*x for x in vec)) or 1.0
+    # vec = [x/n for x in vec]
+    return vec
 
-def build_context(rows: List[tuple], collections_meta: List[Tuple[int,str,str,float]], query: str) -> str:
-    # Group by collection for a tidy context
-    by_coll: dict[int, List[tuple]] = {}
+def insert_chunks(conn, *, collection_id: int, embedding_dim: int, rows: List[Dict[str, Any]]):
+    payload = []
     for r in rows:
-        coll_id = r[1] if len(r) >= 2 else None
-        by_coll.setdefault(coll_id, []).append(r)
+        if "content" not in r or not r["content"]:
+            raise ValueError("Each row must contain non-empty 'content'")
+        embedding = _normalize_embedding(r.get("embedding"), embedding_dim)
+        hk = r.get("hash_key") or _hash_key_for_row(collection_id, r)
+        payload.append((
+            collection_id,
+            r.get("external_id"),
+            r.get("language"),
+            r.get("symbol_kind"),
+            bool(r.get("is_recipe", False)),
+            bool(r.get("is_config", False)),
+            bool(r.get("is_example", False)),
+            r.get("package"),
+            r.get("class_name"),
+            r.get("method_name"),
+            r.get("signature"),
+            r.get("start_line"),
+            r.get("end_line"),
+            r.get("tokens", 0),
+            r["content"],
+            r.get("raw_code"),
+            Json(r.get("metadata") or {}),
+            embedding,
+            hk
+        ))
 
-    name_map = {cid: (name, kbt, score) for cid, name, kbt, score in collections_meta}
-    parts = [f"Query: {query}\n"]
+    with conn.cursor() as cur:
+        execute_values(cur, """
+          INSERT INTO kb_chunks
+          (collection_id, external_id, language, symbol_kind, is_recipe, is_config, is_example,
+           package, class_name, method_name, signature, start_line, end_line, tokens,
+           content, raw_code, metadata, embedding, hash_key)
+          VALUES %s
+          ON CONFLICT (hash_key) DO NOTHING
+        """, payload, page_size=200)
+    conn.commit()
 
-    for cid, items in by_coll.items():
-        name, kbt, cscore = name_map.get(cid, (f"collection:{cid}", "unknown", 0.0))
-        parts.append(f"== Collection: {name}  (type={kbt}, routed_score={cscore:.3f}) ==")
-        for r in items[:5]:
-            if len(r) == 8:  # hybrid shape
-                _id, _coll, ext, kind, v, l, f, content = r
-                parts.append(f"- [{kind or 'doc'}] {ext}  (score={f:.3f})")
-                # include a tiny excerpt
-                snippet = "\n".join((content or "").splitlines()[:30])
-                parts.append(snippet)
-                parts.append("")
-            else:            # lexical-only fallback shape
-                _id, _coll, ext, kind, s, content = r
-                parts.append(f"- [{kind or 'doc'}] {ext}  (score={float(s):.3f})")
-                snippet = "\n".join((content or "").splitlines()[:30])
-                parts.append(snippet)
-                parts.append("")
-    return "\n".join(parts).strip()
+def load_jsonl(path: str) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    with open(path, "r", encoding="utf-8") as f:
+        for i, line in enumerate(f, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError as e:
+                raise ValueError(f"Invalid JSON on line {i}: {e}")
+    return rows
 
-# ---------- CLI ----------
+def demo_rows() -> List[Dict[str, Any]]:
+    # Two tiny rows to smoke-test inserts
+    return [
+        {
+            "external_id": "src/main/java/com/acme/logging/LoggerConfig.java",
+            "language": "java",
+            "symbol_kind": "code",
+            "is_recipe": True,
+            "content": (
+                "How to configure SLF4J + Logback in Spring Boot.\n"
+                "Steps:\n1) Add ch.qos.logback:logback-classic 3.0.15\n"
+                "2) Set logging.level.root=INFO\n"
+            ),
+            "raw_code": "package com.acme.logging; public class LoggerConfig {}",
+            "metadata": {
+                "framework_folder": "logging-framework",
+                "tags": ["logging","java","recipe"],
+                "keywords": ["slf4j","logback","spring-boot","logging.level.root"],
+            },
+            "embedding": None  # zeros
+        },
+        {
+            "external_id": "git:commit/abc123",
+            "language": "text",
+            "symbol_kind": "upgrade",
+            "is_recipe": True,
+            "content": (
+                "[Upgrade]\nFramework: chassis\nCommit: abc123\nDate: 2025-01-01\n"
+                "Change: com.acme:chassis-core 3.0.0 → 3.0.15 (minor)\n\nDiff:\n+ <version>3.0.15</version>"
+            ),
+            "metadata": {
+                "framework_folder": "chassis",
+                "group": "com.acme",
+                "artifact": "chassis-core",
+                "from_version": "3.0.0",
+                "to_version": "3.0.15",
+                "semver_delta": "minor",
+                "tags": ["upgrade"],
+                "keywords": ["chassis","3.0.0","3.0.15"]
+            },
+            "embedding": None  # zeros
+        }
+    ]
+
 def main():
-    ap = argparse.ArgumentParser(description="Auto-route across multiple collections and retrieve LLM context.")
-    ap.add_argument("--query", required=True, help="Natural query, e.g., 'upgrade chassis to latest from 3.0.0'")
-    ap.add_argument("--embedding", default=None, help="Query embedding as JSON/CSV string (optional).")
-    ap.add_argument("--embedding-dim", type=int, default=1024)
-    ap.add_argument("--top-collections", type=int, default=3)
-    ap.add_argument("--k", type=int, default=12)
-    ap.add_argument("--allow-types", default="", help="Comma-separated kb_types to include (optional).")
-    ap.add_argument("--allow-names", default="", help="Comma-separated collection names to include (optional).")
+    ap = argparse.ArgumentParser(description="Insert chunks into kb_collections/kb_chunks (pgvector).")
+    ap.add_argument("--collection-name", required=True, help="Unique name, e.g., code-java, git-log, confluence.")
+    ap.add_argument("--kb-type", required=True, help="Type label, e.g., code, git_log, confluence.")
+    ap.add_argument("--embedding-dim", type=int, default=1024, help="Vector dimension for this collection.")
+    ap.add_argument("--description", default=None, help="Optional collection description.")
+    ap.add_argument("--collection-metadata", default=None, help="JSON for kb_collections.metadata (optional).")
+    ap.add_argument("--input-jsonl", default=None, help="Path to JSONL with rows to insert.")
+    ap.add_argument("--demo", action="store_true", help="Insert two demo rows (for smoke test).")
     args = ap.parse_args()
 
-    qvec = parse_embedding_string(args.embedding, args.embedding_dim) if args.embedding else None
-    allow_types = [s.strip() for s in args.allow_types.split(",") if s.strip()]
-    allow_names = [s.strip() for s in args.allow_names.split(",") if s.strip()]
+    if not args.input_jsonl and not args.demo:
+        print("Provide --input-jsonl or --demo", file=sys.stderr)
+        sys.exit(2)
 
-    conn = _connect()
+    coll_meta = None
+    if args.collection_metadata:
+        try:
+            coll_meta = json.loads(args.collection_metadata)
+        except Exception as e:
+            print(f"Invalid --collection-metadata JSON: {e}", file=sys.stderr)
+            sys.exit(2)
+
+    rows = demo_rows() if args.demo else load_jsonl(args.input_jsonl)
+
+    conn = connect()
     try:
-        colls = pick_collections(conn, args.query, qvec, allow_types, allow_names, args.top_collections)
-        if not colls:
-            print("No candidate collections found.")
-            return
-        ids = [c[0] for c in colls]
-        rows = retrieve_within(conn, args.query, qvec, ids, args.k)
-        context = build_context(rows, colls, args.query)
-        print(context)
-        print("\n[auto] candidate collections:", " | ".join(f"{cid}:{name}({kbt})" for cid,name,kbt,_ in colls))
+        ensure_schema(conn, args.embedding_dim)
+        cid = ensure_collection(conn,
+                                name=args.collection_name,
+                                kb_type=args.kb_type,
+                                embedding_dim=args.embedding_dim,
+                                description=args.description,
+                                metadata=coll_meta)
+        insert_chunks(conn, collection_id=cid, embedding_dim=args.embedding_dim, rows=rows)
+        print(f"[ok] collection '{args.collection_name}' (id={cid}) inserted {len(rows)} rows.")
     finally:
         conn.close()
 
