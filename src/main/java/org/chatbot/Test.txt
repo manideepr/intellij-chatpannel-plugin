@@ -5,8 +5,21 @@ gitlog_upgrade_full.py
 Parse a `git log -p` file and produce ONE merged JSONL that contains:
   - upgrade edges from many sources (Maven/Gradle/catalog/plugins/properties/BOM/parent/wrappers/lockfiles)
   - co-change examples (code/config files changed in same commit as a bump)
+  - release/migration notes snippets
   - version ledgers per artifact (observed versions, latest)
-  - release/migration notes snippets if present
+
+Each JSONL line matches the ingest schema you have:
+{
+  "external_id": "...",
+  "language": "text",
+  "symbol_kind": "...",
+  "is_recipe": true/false,
+  "is_config": true/false,
+  "is_example": true/false,
+  "content": "...",
+  "metadata": { ... },
+  "embedding": null
+}
 
 Usage:
   git -C /path/to/repo log -p --date=iso-strict --no-color > /tmp/repo.log
@@ -18,10 +31,10 @@ Usage:
 """
 
 from __future__ import annotations
-import argparse, json, os, re, sys
+import argparse, json, re, sys
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Any, Dict, List, Tuple, Optional, Iterable
+from typing import Any, Dict, List, Tuple, Optional
 
 # ----------------- generic helpers -----------------
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
@@ -108,6 +121,29 @@ def parse_gitlog(file_path: Path) -> List[dict]:
     if cur:
         commits.append(cur)
     return commits
+
+# ----------------- diff snippet helpers -----------------
+def short_diff_snippet(lines: List[str], hint: str = "", max_lines: int = 80) -> str:
+    """
+    Select compact +/- lines that likely show the version bump,
+    including lines containing a version number, the artifact hint,
+    or 'version' token; keep @@ hunk headers too.
+    """
+    pat = re.compile(re.escape(hint), re.I) if hint else None
+    kept, out = 0, []
+    for ln in lines:
+        if ln.startswith("@@"):
+            out.append(ln); continue
+        if not ln or ln[0] not in "+-":
+            continue
+        if (pat and pat.search(ln)) or "version" in ln.lower() or re.search(r"\d+\.\d+\.\d+", ln):
+            out.append(ln[:240]); kept += 1
+            if kept >= max_lines: break
+    return "\n".join(out)
+
+def strip_markers(snippet: str) -> str:
+    """Optional cleaner: drop leading +/- for a plain code view."""
+    return "\n".join(l[1:] for l in (snippet or "").splitlines() if l and l[0] in "+-")
 
 # ----------------- detectors: core (Gradle/Maven deps) -----------------
 BUILD_FILES = {"pom.xml", "build.gradle", "build.gradle.kts"}
@@ -269,8 +305,9 @@ def detect_wrapper_bumps(lines: List[str]) -> List[Tuple[str,str,str,str]]:
         out.append(("maven", maven_from, maven_to, "maven-wrapper.properties"))
     return out
 
+LOCKFILE_RE    = re.compile(r".*gradle\.lockfile$")
+LOCK_LINE_RE   = re.compile(r'^[+\-]\s*([A-Za-z0-9_.\-]+):([A-Za-z0-9_.\-]+):([A-Za-z0-9+_.\-]+)')
 def detect_lockfile_bumps(lines: List[str]) -> List[Tuple[str,str,str]]:
-    # Returns (group:artifact, from, to) pairs observed in gradle.lockfile diffs
     minus, plus = {}, {}
     for ln in lines:
         m = LOCK_LINE_RE.match(ln)
@@ -328,7 +365,8 @@ class Chunk:
     # embedding omitted (set to null in JSONL)
 
 def make_edge_chunk(fw: str, chash: str, author: str, date: str,
-                    path: str, ga: str, v1: str, v2: str, kind: str="upgrade") -> Chunk:
+                    path: str, ga: str, v1: str, v2: str,
+                    kind: str="upgrade", snippet: Optional[str]=None) -> Chunk:
     group, artifact = ga.split(":", 1)
     delta = semver_delta(v1, v2)
     header = (
@@ -340,7 +378,7 @@ def make_edge_chunk(fw: str, chash: str, author: str, date: str,
         f"File: {path}\n"
         f"Change: {ga} {v1} → {v2} ({delta})\n"
     )
-    body = header + "\nDiff:\n(see commit diff)"
+    body = header + "\nDiff:\n" + (snippet if snippet else "(diff omitted)")
     meta = {
         "framework_folder": fw,
         "group": group, "artifact": artifact,
@@ -499,11 +537,10 @@ def build_chunks(commits: List[dict], base_prefix: str, max_cochange_per_commit:
     plugin_up: List[Chunk] = []
     props: List[Chunk] = []
     tools: List[Chunk] = []
-    locks: List[Chunk] = []
     notes: List[Chunk] = []
     cochg: List[Chunk] = []
 
-    # temp: remember bumps per commit for co-change association
+    # remember bumps per commit for co-change association
     bumps_by_commit: Dict[str, List[Tuple[str,str,str,str]]] = {}  # commit -> list of (fw, ga, from, to)
 
     for c in commits:
@@ -517,14 +554,12 @@ def build_chunks(commits: List[dict], base_prefix: str, max_cochange_per_commit:
 
             # --- primary upgrade sources ---
             bump_list: List[Tuple[str,str,str]] = []
-            kind = "upgrade"
 
             if name in ("build.gradle","build.gradle.kts"):
                 bump_list += detect_gradle_bumps(lines)
                 # plugins too
                 for pid, v1, v2 in detect_gradle_plugin_bumps(lines):
                     plugin_up.append(make_plugin_chunk(fw, chash, author, date, bpath, pid, v1, v2))
-                # gradle.properties handled when name==gradle.properties below
 
             elif name == "pom.xml":
                 bump_list += detect_pom_bumps(lines)
@@ -532,9 +567,12 @@ def build_chunks(commits: List[dict], base_prefix: str, max_cochange_per_commit:
                 for prop, v1, v2 in detect_maven_property_bumps(lines):
                     props.append(make_property_chunk(fw, chash, author, date, bpath, prop, v1, v2, maven=True))
                 for ga, v1, v2 in detect_maven_parent_bump(lines):
-                    edges.append(make_edge_chunk(fw, chash, author, date, bpath, ga, v1, v2, kind="parent_upgrade"))
+                    # parent upgrades shown as edges of the parent coordinates
+                    snippet = short_diff_snippet(lines, hint=ga.split(":",1)[1])
+                    edges.append(make_edge_chunk(fw, chash, author, date, bpath, ga, v1, v2, kind="parent_upgrade", snippet=snippet))
                 for ga, v1, v2 in detect_maven_bom_import_bumps(lines):
-                    edges.append(make_edge_chunk(fw, chash, author, date, bpath, ga, v1, v2, kind="bom_upgrade"))
+                    snippet = short_diff_snippet(lines, hint=ga.split(":",1)[1])
+                    edges.append(make_edge_chunk(fw, chash, author, date, bpath, ga, v1, v2, kind="bom_upgrade", snippet=snippet))
 
             elif TOML_FILE_RE.match(bpath):
                 for ga, v1, v2 in detect_toml_catalog_bumps(lines):
@@ -554,12 +592,14 @@ def build_chunks(commits: List[dict], base_prefix: str, max_cochange_per_commit:
 
             elif LOCKFILE_RE.match(bpath):
                 for ga, v1, v2 in detect_lockfile_bumps(lines):
-                    # treat as lock_update (useful hint, lower priority)
-                    edges.append(make_edge_chunk(fw, chash, author, date, bpath, ga, v1, v2, kind="lock_update"))
+                    snippet = short_diff_snippet(lines, hint=ga.split(":",1)[1])
+                    edges.append(make_edge_chunk(fw, chash, author, date, bpath, ga, v1, v2, kind="lock_update", snippet=snippet))
 
-            # build-file dependency bumps → edges
+            # build-file dependency bumps → edges (with inline snippet)
             for (ga, v1, v2) in bump_list:
-                edges.append(make_edge_chunk(fw, chash, author, date, bpath, ga, v1, v2, kind="upgrade"))
+                group, artifact = ga.split(":", 1)
+                snippet = short_diff_snippet(lines, hint=artifact)
+                edges.append(make_edge_chunk(fw, chash, author, date, bpath, ga, v1, v2, kind="upgrade", snippet=snippet))
                 bumps_by_commit.setdefault(chash, []).append((fw, ga, v1, v2))
 
             # release/migration notes snippets
@@ -587,11 +627,8 @@ def build_chunks(commits: List[dict], base_prefix: str, max_cochange_per_commit:
                     if not snippet:
                         continue
                     cochg.append(make_cochange_chunk(fw, chash, author, date, bpath, ga, v1, v2, snippet, bool(CONF_FILES_RE.match(bpath))))
-                    produced_co += 1
-                    if produced_co >= max_cochange_per_commit:
+                    if len(cochg) >= max_cochange_per_commit:
                         break
-                if produced_co >= max_cochange_per_commit:
-                    break
 
     # ---- version ledgers from edges (and BOM/parent/lock_update too) ----
     ledgers = build_ledgers_from_edges(edges)
@@ -602,7 +639,6 @@ def build_chunks(commits: List[dict], base_prefix: str, max_cochange_per_commit:
     all_chunks.extend(plugin_up)
     all_chunks.extend(props)
     all_chunks.extend(tools)
-    all_chunks.extend(locks)  # (kept for symmetry; 'edges' already contains lock_update edges)
     all_chunks.extend(notes)
     all_chunks.extend(cochg)
     all_chunks.extend(ledgers)
@@ -651,7 +687,7 @@ def build_ledgers_from_edges(edge_chunks: List[Chunk]) -> List[Chunk]:
 
 # ----------------- CLI -----------------
 def main():
-    ap = argparse.ArgumentParser(description="Parse git log -p and emit ONE merged JSONL with edges/ledgers/cochanges/plugins/properties/tools/notes.")
+    ap = argparse.ArgumentParser(description="Parse git log -p and emit ONE merged JSONL with edges/ledgers/cochanges/plugins/properties/tools/notes (with diff snippets).")
     ap.add_argument("--log-file", required=True, help="Path to file produced by `git log -p` (use --date=iso-strict --no-color).")
     ap.add_argument("--base-prefix", default="frameworks/", help="Prefix to infer framework folder (e.g., 'frameworks/').")
     ap.add_argument("--out", default="merged_chunks.jsonl", help="Output JSONL path (single file with all chunks).")
