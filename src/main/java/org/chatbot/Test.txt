@@ -1,375 +1,673 @@
 #!/usr/bin/env python3
 """
-kb_ingest.py  —  Create kb_* tables, upsert collection, insert chunks (idempotent)
+gitlog_upgrade_full.py
+----------------------
+Parse a `git log -p` file and produce ONE merged JSONL that contains:
+  - upgrade edges from many sources (Maven/Gradle/catalog/plugins/properties/BOM/parent/wrappers/lockfiles)
+  - co-change examples (code/config files changed in same commit as a bump)
+  - version ledgers per artifact (observed versions, latest)
+  - release/migration notes snippets if present
 
-Requires:
-  pip install psycopg2-binary pgvector
+Usage:
+  git -C /path/to/repo log -p --date=iso-strict --no-color > /tmp/repo.log
 
-Env:
-  PGHOST, PGPORT, PGDATABASE, PGUSER, PGPASSWORD
-
-Usage examples:
-
-  # 1) Quick smoke test (demo rows; zeros embeddings)
-  python kb_ingest.py \
-    --collection-name code-java --kb-type code --embedding-dim 1024 --demo
-
-  # 2) Insert from JSONL (one JSON object per line)
-  python kb_ingest.py \
-    --collection-name git-log --kb-type git_log --embedding-dim 1024 \
-    --input-jsonl /path/to/edges_and_ledgers.jsonl
+  python gitlog_upgrade_full.py \
+    --log-file /tmp/repo.log \
+    --base-prefix "frameworks/" \
+    --out merged_chunks.jsonl
 """
 
 from __future__ import annotations
-import argparse, json, os, re, sys, hashlib
-from typing import Any, Dict, List, Optional
-
-import psycopg2
-from pgvector.psycopg2 import register_vector
-from psycopg2.extras import Json, execute_values
-
-DDL = """
-CREATE EXTENSION IF NOT EXISTS vector;
-CREATE EXTENSION IF NOT EXISTS pg_trgm;
-
-CREATE TABLE IF NOT EXISTS kb_collections (
-  id BIGSERIAL PRIMARY KEY,
-  name TEXT UNIQUE NOT NULL,
-  kb_type TEXT NOT NULL,                -- e.g. 'code', 'git_log', 'confluence'
-  description TEXT,
-  embedding_dim INT NOT NULL,
-  distance TEXT NOT NULL DEFAULT 'cosine',
-  metadata JSONB DEFAULT '{}'::jsonb,
-  created_at TIMESTAMPTZ DEFAULT now()
-);
-
-CREATE TABLE IF NOT EXISTS kb_chunks (
-  id BIGSERIAL PRIMARY KEY,
-  collection_id BIGINT NOT NULL REFERENCES kb_collections(id) ON DELETE CASCADE,
-  external_id TEXT,
-  language TEXT,
-  symbol_kind TEXT,                     -- 'code','config','upgrade','version_ledger',...
-  is_recipe BOOLEAN DEFAULT FALSE,
-  is_config BOOLEAN DEFAULT FALSE,
-  is_example BOOLEAN DEFAULT FALSE,
-  package TEXT,
-  class_name TEXT,
-  method_name TEXT,
-  signature TEXT,
-  start_line INT,
-  end_line INT,
-  tokens INT,
-  content TEXT NOT NULL,                -- what you search over
-  raw_code TEXT,                        -- optional full code
-  metadata JSONB DEFAULT '{}'::jsonb,   -- your tags/keywords/etc.
-  embedding VECTOR(%(dim)s),
-  hash_key TEXT UNIQUE                  -- for idempotent upserts
-);
-
-CREATE INDEX IF NOT EXISTS kb_chunks_embedding_hnsw ON kb_chunks USING hnsw (embedding vector_cosine_ops);
-CREATE INDEX IF NOT EXISTS kb_chunks_content_trgm   ON kb_chunks USING gin  (content gin_trgm_ops);
-CREATE INDEX IF NOT EXISTS kb_chunks_collection     ON kb_chunks(collection_id);
-"""
-
-def connect():
-    conn = psycopg2.connect(
-        host=os.getenv("PGHOST","localhost"),
-        port=int(os.getenv("PGPORT","5432")),
-        dbname=os.getenv("PGDATABASE"),
-        user=os.getenv("PGUSER"),
-        password=os.getenv("PGPASSWORD"),
-    )
-    register_vector(conn)
-    return conn
-
-def ensure_schema(conn, embedding_dim: int):
-    with conn.cursor() as cur:
-        cur.execute(DDL, {"dim": embedding_dim})
-    conn.commit()
-
-def ensure_collection(conn, *, name: str, kb_type: str, embedding_dim: int,
-                      description: Optional[str] = None,
-                      metadata: Optional[Dict[str, Any]] = None) -> int:
-    metadata = metadata or {}
-    with conn.cursor() as cur:
-        cur.execute("""
-            INSERT INTO kb_collections(name, kb_type, description, embedding_dim, metadata)
-            VALUES (%s,%s,%s,%s,%s)
-            ON CONFLICT (name) DO NOTHING;
-        """, (name, kb_type, description, embedding_dim, Json(metadata)))
-        cur.execute("SELECT id, embedding_dim FROM kb_collections WHERE name=%s", (name,))
-        row = cur.fetchone()
-        if not row:
-            raise RuntimeError("Failed to read/create collection")
-        cid, dim = row
-        if dim != embedding_dim:
-            raise ValueError(f"Collection '{name}' embedding_dim={dim} != expected {embedding_dim}. "
-                             f"Use a new collection or re-create with the desired dimension.")
-        return cid
-
-def _hash_key_for_row(collection_id: int, r: Dict[str, Any]) -> str:
-    # Stable hash: collection + external_id + symbol_kind + versions/commit + first 128 chars of content
-    md = r.get("metadata") or {}
-    fields = [
-        str(collection_id),
-        r.get("external_id") or "",
-        r.get("symbol_kind") or "",
-        md.get("commit",""),
-        (md.get("from_version","") + "->" + md.get("to_version","")) if (md.get("from_version") or md.get("to_version")) else "",
-        (r.get("content") or "")[:128],
-    ]
-    return hashlib.sha256("|".join(fields).encode("utf-8")).hexdigest()
-
-def _normalize_embedding(v: Optional[Any], dim: int) -> List[float]:
-    if v is None:
-        return [0.0]*dim
-    if isinstance(v, str):
-        s = v.strip()
-        if s.startswith("[") and s.endswith("]"):
-            s = s[1:-1]
-        parts = re.split(r"[,\s]+", s)
-        vec = [float(x) for x in parts if x != ""]
-    elif isinstance(v, (list, tuple)):
-        vec = [float(x) for x in v]
-    else:
-        raise ValueError("embedding must be list/tuple or string")
-    if len(vec) != dim:
-        raise ValueError(f"Embedding length {len(vec)} != {dim}")
-    # (Optional) L2-normalize — depends on how your retrieval expects vectors
-    # Here we keep as-is; uncomment to normalize:
-    # import math
-    # n = math.sqrt(sum(x*x for x in vec)) or 1.0
-    # vec = [x/n for x in vec]
-    return vec
-
-def insert_chunks(conn, *, collection_id: int, embedding_dim: int, rows: List[Dict[str, Any]]):
-    payload = []
-    for r in rows:
-        if "content" not in r or not r["content"]:
-            raise ValueError("Each row must contain non-empty 'content'")
-        embedding = _normalize_embedding(r.get("embedding"), embedding_dim)
-        hk = r.get("hash_key") or _hash_key_for_row(collection_id, r)
-        payload.append((
-            collection_id,
-            r.get("external_id"),
-            r.get("language"),
-            r.get("symbol_kind"),
-            bool(r.get("is_recipe", False)),
-            bool(r.get("is_config", False)),
-            bool(r.get("is_example", False)),
-            r.get("package"),
-            r.get("class_name"),
-            r.get("method_name"),
-            r.get("signature"),
-            r.get("start_line"),
-            r.get("end_line"),
-            r.get("tokens", 0),
-            r["content"],
-            r.get("raw_code"),
-            Json(r.get("metadata") or {}),
-            embedding,
-            hk
-        ))
-
-    with conn.cursor() as cur:
-        execute_values(cur, """
-          INSERT INTO kb_chunks
-          (collection_id, external_id, language, symbol_kind, is_recipe, is_config, is_example,
-           package, class_name, method_name, signature, start_line, end_line, tokens,
-           content, raw_code, metadata, embedding, hash_key)
-          VALUES %s
-          ON CONFLICT (hash_key) DO NOTHING
-        """, payload, page_size=200)
-    conn.commit()
-
-def load_jsonl(path: str) -> List[Dict[str, Any]]:
-    rows: List[Dict[str, Any]] = []
-    with open(path, "r", encoding="utf-8") as f:
-        for i, line in enumerate(f, 1):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                rows.append(json.loads(line))
-            except json.JSONDecodeError as e:
-                raise ValueError(f"Invalid JSON on line {i}: {e}")
-    return rows
-
-def demo_rows() -> List[Dict[str, Any]]:
-    # Two tiny rows to smoke-test inserts
-    return [
-        {
-            "external_id": "src/main/java/com/acme/logging/LoggerConfig.java",
-            "language": "java",
-            "symbol_kind": "code",
-            "is_recipe": True,
-            "content": (
-                "How to configure SLF4J + Logback in Spring Boot.\n"
-                "Steps:\n1) Add ch.qos.logback:logback-classic 3.0.15\n"
-                "2) Set logging.level.root=INFO\n"
-            ),
-            "raw_code": "package com.acme.logging; public class LoggerConfig {}",
-            "metadata": {
-                "framework_folder": "logging-framework",
-                "tags": ["logging","java","recipe"],
-                "keywords": ["slf4j","logback","spring-boot","logging.level.root"],
-            },
-            "embedding": None  # zeros
-        },
-        {
-            "external_id": "git:commit/abc123",
-            "language": "text",
-            "symbol_kind": "upgrade",
-            "is_recipe": True,
-            "content": (
-                "[Upgrade]\nFramework: chassis\nCommit: abc123\nDate: 2025-01-01\n"
-                "Change: com.acme:chassis-core 3.0.0 → 3.0.15 (minor)\n\nDiff:\n+ <version>3.0.15</version>"
-            ),
-            "metadata": {
-                "framework_folder": "chassis",
-                "group": "com.acme",
-                "artifact": "chassis-core",
-                "from_version": "3.0.0",
-                "to_version": "3.0.15",
-                "semver_delta": "minor",
-                "tags": ["upgrade"],
-                "keywords": ["chassis","3.0.0","3.0.15"]
-            },
-            "embedding": None  # zeros
-        }
-    ]
-
-def main():
-    ap = argparse.ArgumentParser(description="Insert chunks into kb_collections/kb_chunks (pgvector).")
-    ap.add_argument("--collection-name", required=True, help="Unique name, e.g., code-java, git-log, confluence.")
-    ap.add_argument("--kb-type", required=True, help="Type label, e.g., code, git_log, confluence.")
-    ap.add_argument("--embedding-dim", type=int, default=1024, help="Vector dimension for this collection.")
-    ap.add_argument("--description", default=None, help="Optional collection description.")
-    ap.add_argument("--collection-metadata", default=None, help="JSON for kb_collections.metadata (optional).")
-    ap.add_argument("--input-jsonl", default=None, help="Path to JSONL with rows to insert.")
-    ap.add_argument("--demo", action="store_true", help="Insert two demo rows (for smoke test).")
-    args = ap.parse_args()
-
-    if not args.input_jsonl and not args.demo:
-        print("Provide --input-jsonl or --demo", file=sys.stderr)
-        sys.exit(2)
-
-    coll_meta = None
-    if args.collection_metadata:
-        try:
-            coll_meta = json.loads(args.collection_metadata)
-        except Exception as e:
-            print(f"Invalid --collection-metadata JSON: {e}", file=sys.stderr)
-            sys.exit(2)
-
-    rows = demo_rows() if args.demo else load_jsonl(args.input_jsonl)
-
-    conn = connect()
-    try:
-        ensure_schema(conn, args.embedding_dim)
-        cid = ensure_collection(conn,
-                                name=args.collection_name,
-                                kb_type=args.kb_type,
-                                embedding_dim=args.embedding_dim,
-                                description=args.description,
-                                metadata=coll_meta)
-        insert_chunks(conn, collection_id=cid, embedding_dim=args.embedding_dim, rows=rows)
-        print(f"[ok] collection '{args.collection_name}' (id={cid}) inserted {len(rows)} rows.")
-    finally:
-        conn.close()
-
-if __name__ == "__main__":
-    main()
-
-
-
-
-#!/usr/bin/env python3
-# convert_edges_ledgers_for_ingest.py
-import argparse, json
+import argparse, json, os, re, sys
+from dataclasses import dataclass, asdict
 from pathlib import Path
+from typing import Any, Dict, List, Tuple, Optional, Iterable
 
-def iter_jsonl(path):
-    if not path: return []
-    rows = []
-    with open(path, "r", encoding="utf-8") as f:
-        for ln in f:
-            ln = ln.strip()
-            if ln:
-                rows.append(json.loads(ln))
-    return rows
+# ----------------- generic helpers -----------------
+ANSI = re.compile(r"\x1b\[[0-9;]*m")
+SEMVER = re.compile(r"^(\d+)\.(\d+)\.(\d+)(?:[+.\-][0-9A-Za-z]+)?$")
 
-def edge_to_row(e: dict) -> dict:
-    # Fields produced by gitlog_to_upgrade_chunks.py (UpgradeEdge dataclass)
-    meta = {
-        "framework_folder": e.get("framework_folder"),
-        "group": e.get("group"),
-        "artifact": e.get("artifact"),
-        "from_version": e.get("from_version"),
-        "to_version": e.get("to_version"),
-        "semver_delta": e.get("semver_delta"),
-        "commit": e.get("commit"),
-        "author": e.get("author"),
-        "date": e.get("date"),
-        "source_path": e.get("file"),
-        "tags": e.get("tags") or ["upgrade"],
-        "keywords": e.get("keywords") or [],
-    }
-    return {
-        "external_id": e.get("file") or f"git:{e.get('commit','')}",
-        "language": "text",
-        "symbol_kind": e.get("symbol_kind", "upgrade"),
-        "is_recipe": True,
-        "is_config": False,
-        "is_example": False,
-        "content": e.get("content", ""),
-        "raw_code": None,
-        "metadata": meta,
-        "embedding": None  # keep None → kb_ingest.py will store zeros
-    }
+def semver_key(v: str) -> tuple[int,int,int,int]:
+    m = SEMVER.match((v or "").strip())
+    if not m:
+        return (0,0,0,-len(v))
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3)), 0)
 
-def ledger_to_row(L: dict) -> dict:
-    # Fields produced by gitlog_to_upgrade_chunks.py (VersionLedger dataclass)
-    fw = L.get("framework_folder")
-    g  = L.get("group")
-    a  = L.get("artifact")
+def semver_delta(a: str, b: str) -> str:
+    ma, mb = SEMVER.match(a or ""), SEMVER.match(b or "")
+    if not (ma and mb): return "other"
+    A = (int(ma.group(1)), int(ma.group(2)), int(ma.group(3)))
+    B = (int(mb.group(1)), int(mb.group(2)), int(mb.group(3)))
+    if A[0] != B[0]: return "major"
+    if A[1] != B[1]: return "minor"
+    if A[2] != B[2]: return "patch"
+    return "other"
+
+def first_segment_after(path: str, base_prefix: str) -> str:
+    path = path.lstrip("/")
+    if base_prefix and base_prefix in path:
+        _, after = path.split(base_prefix, 1)
+        after = after.lstrip("/")
+        return after.split("/", 1)[0] if after else base_prefix.strip("/").split("/")[-1]
+    return path.split("/", 1)[0] if "/" in path else path
+
+# ----------------- git log -p parser -----------------
+COMMIT_LINE = re.compile(r"^commit\s+([0-9a-f]{7,40})\b", re.I)
+AUTHOR_LINE = re.compile(r"^Author:\s*(.+)$", re.I)
+DATE_LINE   = re.compile(r"^Date:\s*(.+)$", re.I)
+DIFF_START  = re.compile(r"^diff --git a/(.+?) b/(.+)$")
+HUNK_START  = re.compile(r"^@@ ")
+
+def parse_gitlog(file_path: Path) -> List[dict]:
+    """
+    Returns a list of commits with minimal structure:
+      {hash, author, date, diffs: [{a, b, lines: [...] }]}
+    """
+    txt = ANSI.sub("", file_path.read_text(encoding="utf-8", errors="ignore"))
+    lines = txt.splitlines()
+
+    commits: List[dict] = []
+    cur: Optional[dict] = None
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        m = COMMIT_LINE.match(line)
+        if m:
+            if cur:
+                commits.append(cur)
+            cur = {"hash": m.group(1), "author": "", "date": "", "diffs": []}
+            i += 1
+            # headers until blank/diff
+            while i < len(lines):
+                l = lines[i]
+                if DIFF_START.match(l) or l.strip() == "":
+                    break
+                am = AUTHOR_LINE.match(l)
+                dm = DATE_LINE.match(l)
+                if am: cur["author"] = am.group(1).strip()
+                if dm: cur["date"]   = dm.group(1).strip()
+                i += 1
+            continue
+
+        if cur:
+            dm = DIFF_START.match(line)
+            if dm:
+                a_path, b_path = dm.group(1), dm.group(2)
+                diff = {"a": a_path, "b": b_path, "lines": []}
+                i += 1
+                while i < len(lines):
+                    l2 = lines[i]
+                    if COMMIT_LINE.match(l2) or DIFF_START.match(l2):
+                        break
+                    diff["lines"].append(l2)
+                    i += 1
+                cur["diffs"].append(diff)
+                continue
+        i += 1
+
+    if cur:
+        commits.append(cur)
+    return commits
+
+# ----------------- detectors: core (Gradle/Maven deps) -----------------
+BUILD_FILES = {"pom.xml", "build.gradle", "build.gradle.kts"}
+
+# Gradle deps like "group:artifact:version"
+GR_COORD_RE = re.compile(r'["\']([A-Za-z0-9_.\-]+:[A-Za-z0-9_.\-]+):([A-Za-z0-9+_.\-]+)["\']')
+
+# Maven inlined dependency triplet (simple)
+POM_G_RE = re.compile(r"<groupId>\s*([^<]+)\s*</groupId>", re.I)
+POM_A_RE = re.compile(r"<artifactId>\s*([^<]+)\s*</artifactId>", re.I)
+POM_V_RE = re.compile(r"<version>\s*([^<]+)\s*</version>", re.I)
+
+def detect_gradle_bumps(lines: List[str]) -> List[Tuple[str,str,str]]:
+    minus, plus = {}, {}
+    for ln in lines:
+        if not ln: continue
+        if ln[0] in "+-":
+            for m in GR_COORD_RE.finditer(ln[1:]):
+                ga, ver = m.group(1), m.group(2)
+                if ln[0] == "-": minus[ga] = ver
+                else: plus[ga] = ver
+    return [(ga, minus[ga], plus[ga]) for ga in sorted(set(minus)&set(plus)) if minus[ga]!=plus[ga]]
+
+def detect_pom_bumps(lines: List[str]) -> List[Tuple[str,str,str]]:
+    cur_g = cur_a = None
+    pending_from: Optional[str] = None
+    out: List[Tuple[str,str,str]] = []
+    for ln in lines:
+        if not ln: continue
+        head, body = (ln[0], ln[1:]) if ln[0] in "+- " else (None, ln)
+        mg = POM_G_RE.search(body); ma = POM_A_RE.search(body)
+        if mg: cur_g = mg.group(1).strip()
+        if ma: cur_a = ma.group(1).strip()
+        mv = POM_V_RE.search(body)
+        if head == "-" and mv:
+            pending_from = mv.group(1).strip()
+        elif head == "+" and mv and pending_from:
+            to_v = mv.group(1).strip()
+            if cur_g and cur_a and pending_from != to_v:
+                out.append((f"{cur_g}:{cur_a}", pending_from, to_v))
+            pending_from = None
+        if HUNK_START.match(ln):
+            pending_from = None
+    return out
+
+# ----------------- detectors: Version Catalog / Plugins / Properties / BOM / Parent / Wrappers / Lockfile -----------------
+TOML_FILE_RE   = re.compile(r".*/libs\.versions\.toml$")
+TOML_VER_KV    = re.compile(r'^([+\-])\s*([A-Za-z0-9_.-]+)\s*=\s*"(.*?)"\s*$')  # in [versions]
+TOML_LIB_KV    = re.compile(r'([A-Za-z0-9_.-]+)\s*=\s*\{\s*module\s*=\s*"(.*?)"[^}]*version\.ref\s*=\s*"(.*?)"')
+GR_PLUGIN_RE   = re.compile(r'^[+\-]\s*id\(["\']([^"\']+)["\']\)\s*version\s*["\']([^"\']+)["\']')
+PROP_LINE_RE   = re.compile(r'^([+\-])\s*([A-Za-z0-9_.-]+)\s*=\s*([^\s#]+)\s*$')  # gradle.properties style
+MVN_PROP_RE    = re.compile(r'^[+\-].*?<([A-Za-z0-9_.-]+)\.version>\s*([^<\s]+)\s*</\1\.version>')
+MVN_PARENT_RE  = re.compile(r'^[+\-].*?<parent>.*?<groupId>\s*([^<]+)\s*</groupId>.*?<artifactId>\s*([^<]+)\s*</artifactId>.*?<version>\s*([^<]+)\s*</version>', re.S)
+MVN_BOM_RE     = re.compile(r'^[+\-].*?<dependency>.*?<groupId>\s*([^<]+)\s*</groupId>.*?<artifactId>\s*([^<]+)\s*</artifactId>.*?<version>\s*([^<]+)\s*</version>.*?<type>\s*pom\s*</type>.*?<scope>\s*import\s*</scope>', re.S)
+WRAPPER_GR_RE  = re.compile(r'^[+\-].*?distributionUrl=.*?gradle-([0-9][0-9.\-a-z]+)-')
+WRAPPER_MVN_RE = re.compile(r'^[+\-].*?distributionUrl=.*?apache-maven-([0-9][0-9.\-a-z]+)-')
+
+LOCKFILE_RE    = re.compile(r".*gradle\.lockfile$")
+LOCK_LINE_RE   = re.compile(r'^[+\-]\s*([A-Za-z0-9_.\-]+):([A-Za-z0-9_.\-]+):([A-Za-z0-9+_.\-]+)')
+
+def detect_toml_catalog_bumps(lines: List[str]) -> List[Tuple[str,str,str]]:
+    minus, plus = {}, {}
+    in_versions = False
+    for ln in lines:
+        s = ln.strip()
+        if s.startswith("[versions]"): in_versions = True; continue
+        if s.startswith("[") and not s.startswith("[versions]"): in_versions = False
+        if not in_versions: continue
+        m = TOML_VER_KV.match(ln)
+        if not m: continue
+        sign, key, val = m.groups()
+        if sign == "-": minus[key] = val
+        elif sign == "+": plus[key] = val
+    if not minus or not plus:
+        return []
+    # gather libraries mapping to version.ref
+    libs: Dict[str, Tuple[str,str]] = {}
+    for ln in lines:
+        m = TOML_LIB_KV.search(ln)
+        if m:
+            alias, module, vref = m.groups()
+            libs[alias] = (module, vref)
+    by_ref: Dict[str, List[str]] = {}
+    for alias,(module,vref) in libs.items():
+        by_ref.setdefault(vref, []).append(module)
+    out = []
+    for key in set(minus) & set(plus):
+        if minus[key] != plus[key]:
+            for module in by_ref.get(key, []):
+                out.append((module, minus[key], plus[key]))
+    return out
+
+def detect_gradle_plugin_bumps(lines: List[str]) -> List[Tuple[str,str,str]]:
+    minus, plus = {}, {}
+    for ln in lines:
+        m = GR_PLUGIN_RE.match(ln)
+        if not m: continue
+        pid, ver = m.groups()
+        if ln.lstrip().startswith("-"): minus[pid] = ver
+        elif ln.lstrip().startswith("+"): plus[pid] = ver
+    return [(pid, minus[pid], plus[pid]) for pid in set(minus)&set(plus) if minus[pid]!=plus[pid]]
+
+def detect_gradle_properties_bumps(lines: List[str]) -> List[Tuple[str,str,str]]:
+    minus, plus = {}, {}
+    for ln in lines:
+        m = PROP_LINE_RE.match(ln)
+        if not m: continue
+        sign, key, val = m.groups()
+        if sign == "-": minus[key] = val
+        else: plus[key] = val
+    return [(k, minus[k], plus[k]) for k in set(minus)&set(plus) if minus[k]!=plus[k]]
+
+def detect_maven_property_bumps(lines: List[str]) -> List[Tuple[str,str,str]]:
+    minus, plus = {}, {}
+    for ln in lines:
+        m = MVN_PROP_RE.match(ln)
+        if not m: continue
+        sign = ln[0]
+        pname, val = m.group(1)+".version", m.group(2)
+        if sign == "-": minus[pname] = val
+        else: plus[pname] = val
+    return [(k, minus[k], plus[k]) for k in set(minus)&set(plus) if minus[k]!=plus[k]]
+
+def detect_maven_parent_bump(lines: List[str]) -> List[Tuple[str,str,str]]:
+    minus = plus = None
+    for ln in lines:
+        m = MVN_PARENT_RE.match(ln)
+        if m:
+            ga = f"{m.group(1)}:{m.group(2)}"; ver = m.group(3)
+            if ln[0] == "-": minus = (ga, ver)
+            elif ln[0] == "+": plus = (ga, ver)
+    return [(minus[0], minus[1], plus[1])] if minus and plus and minus[1]!=plus[1] else []
+
+def detect_maven_bom_import_bumps(lines: List[str]) -> List[Tuple[str,str,str]]:
+    minus, plus = {}, {}
+    for ln in lines:
+        m = MVN_BOM_RE.match(ln)
+        if not m: continue
+        ga = f"{m.group(1)}:{m.group(2)}"; ver = m.group(3)
+        if ln[0] == "-": minus[ga] = ver
+        else: plus[ga]   = ver
+    return [(ga, minus[ga], plus[ga]) for ga in set(minus)&set(plus) if minus[ga]!=plus[ga]]
+
+def detect_wrapper_bumps(lines: List[str]) -> List[Tuple[str,str,str,str]]:
+    gradle_from = gradle_to = maven_from = maven_to = None
+    for ln in lines:
+        mg = WRAPPER_GR_RE.match(ln)
+        if mg:
+            if ln[0] == "-": gradle_from = mg.group(1)
+            elif ln[0] == "+": gradle_to = mg.group(1)
+        mm = WRAPPER_MVN_RE.match(ln)
+        if mm:
+            if ln[0] == "-": maven_from = mm.group(1)
+            elif ln[0] == "+": maven_to = mm.group(1)
+    out = []
+    if gradle_from and gradle_to and gradle_from!=gradle_to:
+        out.append(("gradle", gradle_from, gradle_to, "gradle-wrapper.properties"))
+    if maven_from and maven_to and maven_from!=maven_to:
+        out.append(("maven", maven_from, maven_to, "maven-wrapper.properties"))
+    return out
+
+def detect_lockfile_bumps(lines: List[str]) -> List[Tuple[str,str,str]]:
+    # Returns (group:artifact, from, to) pairs observed in gradle.lockfile diffs
+    minus, plus = {}, {}
+    for ln in lines:
+        m = LOCK_LINE_RE.match(ln)
+        if not m: continue
+        ga = f"{m.group(1)}:{m.group(2)}"; ver = m.group(3)
+        if ln[0] == "-": minus[ga] = ver
+        else: plus[ga] = ver
+    return [(ga, minus[ga], plus[ga]) for ga in set(minus)&set(plus) if minus[ga]!=plus[ga]]
+
+# ----------------- co-change & release notes -----------------
+CODE_FILES_RE = re.compile(r".*\.(java|kt|kts|scala|groovy)$", re.I)
+CONF_FILES_RE = re.compile(r"(application.*\.(ya?ml|properties)|logback.*\.xml|log4j2\.xml)$", re.I)
+NOTES_FILES_RE = re.compile(r"(CHANGELOG\.md|MIGRATION\.md|UPGRADING\.md|RELEASE_NOTES\.md)$", re.I)
+
+def cochange_keywords(artifact: str) -> List[re.Pattern]:
+    toks = [artifact.split("-")[0], "import ", "@Deprecated", "Logger", "Slf4j", "LogManager",
+            "builder", "Factory", "migration", "config", "property", "yaml", "xml"]
+    return [re.compile(re.escape(t), re.I) for t in toks if t]
+
+def extract_cochange_snippet(diff_lines: List[str], artifact: str, max_lines:int=80) -> str:
+    pats = cochange_keywords(artifact)
+    kept, out = 0, []
+    for ln in diff_lines:
+        if ln.startswith("@@"):
+            out.append(ln); continue
+        if not ln or ln[0] not in "+-":
+            continue
+        if any(p.search(ln) for p in pats) or re.search(r"\d+\.\d+\.\d+", ln):
+            out.append(ln[:240]); kept += 1
+            if kept >= max_lines: break
+    return "\n".join(out)
+
+def extract_notes_snippet(diff_lines: List[str], max_lines:int=120) -> str:
+    kept, out = 0, []
+    for ln in diff_lines:
+        if ln.startswith("@@"):
+            out.append(ln); continue
+        if ln and ln[0] in "+-":
+            if re.search(r"(?i)breaking|deprecat|migrat|upgrade|change|fix|security|CVE|\b(v|version)\s*\d", ln):
+                out.append(ln[:240]); kept += 1
+                if kept >= max_lines: break
+    return "\n".join(out)
+
+# ----------------- data classes (unified shape) -----------------
+@dataclass
+class Chunk:
+    external_id: str
+    language: str
+    symbol_kind: str
+    is_recipe: bool
+    is_config: bool
+    is_example: bool
+    content: str
+    metadata: Dict[str, Any]
+    # embedding omitted (set to null in JSONL)
+
+def make_edge_chunk(fw: str, chash: str, author: str, date: str,
+                    path: str, ga: str, v1: str, v2: str, kind: str="upgrade") -> Chunk:
+    group, artifact = ga.split(":", 1)
+    delta = semver_delta(v1, v2)
+    header = (
+        f"[Upgrade]\n"
+        f"Framework: {fw}\n"
+        f"Commit: {chash}\n"
+        f"Author: {author}\n"
+        f"Date: {date}\n"
+        f"File: {path}\n"
+        f"Change: {ga} {v1} → {v2} ({delta})\n"
+    )
+    body = header + "\nDiff:\n(see commit diff)"
     meta = {
         "framework_folder": fw,
-        "group": g,
-        "artifact": a,
-        "versions": L.get("versions") or [],
-        "latest": L.get("latest"),
-        "latest_date": L.get("latest_date"),
-        "tags": (L.get("tags") or []) + ["versions"],
-        "keywords": L.get("keywords") or [],
+        "group": group, "artifact": artifact,
+        "from_version": v1, "to_version": v2, "semver_delta": delta,
+        "commit": chash, "author": author, "date": date,
+        "source_path": path,
+        "tags": ["upgrade"], "keywords": [fw, group, artifact, v1, v2, kind]
     }
-    return {
-        "external_id": f"versions/{fw}/{g}:{a}",
-        "language": "text",
-        "symbol_kind": L.get("symbol_kind", "version_ledger"),
-        "is_recipe": False,
-        "is_config": False,
-        "is_example": False,
-        "content": L.get("content", ""),
-        "raw_code": None,
-        "metadata": meta,
-        "embedding": None
-    }
+    return Chunk(
+        external_id=path or chash,
+        language="text",
+        symbol_kind=kind,
+        is_recipe=True, is_config=False, is_example=False,
+        content=body,
+        metadata=meta
+    )
 
+def make_property_chunk(fw: str, chash: str, author: str, date: str,
+                        path: str, prop: str, v1: str, v2: str, maven: bool=False) -> Chunk:
+    header = (
+        f"[Version Property]\nFramework: {fw}\nCommit: {chash}\nAuthor: {author}\nDate: {date}\n"
+        f"File: {path}\nChange: {prop} {v1} → {v2}\n"
+    )
+    meta = {
+        "framework_folder": fw,
+        "group": "property", "artifact": prop,
+        "from_version": v1, "to_version": v2,
+        "commit": chash, "author": author, "date": date,
+        "source_path": path,
+        "tags": ["version_property","upgrade"], "keywords": [fw, prop, v1, v2, "maven" if maven else "gradle"]
+    }
+    return Chunk(
+        external_id=path or chash,
+        language="text",
+        symbol_kind="version_property",
+        is_recipe=True, is_config=False, is_example=False,
+        content=header + "\nDiff:\n(see commit diff)",
+        metadata=meta
+    )
+
+def make_plugin_chunk(fw: str, chash: str, author: str, date: str,
+                      path: str, plugin_id: str, v1: str, v2: str) -> Chunk:
+    header = (
+        f"[Plugin Upgrade]\nFramework: {fw}\nCommit: {chash}\nAuthor: {author}\nDate: {date}\n"
+        f"File: {path}\nChange: {plugin_id} {v1} → {v2}\n"
+    )
+    meta = {
+        "framework_folder": fw,
+        "group": "plugin", "artifact": plugin_id,
+        "from_version": v1, "to_version": v2,
+        "commit": chash, "author": author, "date": date,
+        "source_path": path,
+        "tags": ["upgrade","plugin"], "keywords": [fw, plugin_id, v1, v2]
+    }
+    return Chunk(
+        external_id=path or chash,
+        language="text",
+        symbol_kind="plugin_upgrade",
+        is_recipe=True, is_config=False, is_example=False,
+        content=header + "\nDiff:\n(see commit diff)",
+        metadata=meta
+    )
+
+def make_tool_chunk(fw: str, chash: str, author: str, date: str,
+                    path: str, tool: str, v1: str, v2: str) -> Chunk:
+    header = (
+        f"[Tool Upgrade]\nFramework: {fw}\nCommit: {chash}\nAuthor: {author}\nDate: {date}\n"
+        f"File: {path}\nChange: {tool} {v1} → {v2}\n"
+    )
+    meta = {
+        "framework_folder": fw,
+        "group": "tool", "artifact": tool,
+        "from_version": v1, "to_version": v2,
+        "commit": chash, "author": author, "date": date,
+        "source_path": path,
+        "tags": ["upgrade","tool"], "keywords": [fw, tool, v1, v2]
+    }
+    return Chunk(
+        external_id=path or chash,
+        language="text",
+        symbol_kind="tool_upgrade",
+        is_recipe=True, is_config=False, is_example=False,
+        content=header + "\nDiff:\n(see commit diff)",
+        metadata=meta
+    )
+
+def make_cochange_chunk(fw: str, chash: str, author: str, date: str,
+                        path: str, ga: str, v1: str, v2: str, snippet: str, is_config: bool) -> Chunk:
+    group, artifact = ga.split(":",1)
+    header = (
+        f"[Co-change]\nFramework: {fw}\nCommit: {chash}\nAuthor: {author}\nDate: {date}\n"
+        f"File: {path}\nRelated bump: {ga} {v1} → {v2}\n"
+    )
+    meta = {
+        "framework_folder": fw,
+        "group": group, "artifact": artifact,
+        "from_version": v1, "to_version": v2,
+        "commit": chash, "author": author, "date": date,
+        "source_path": path,
+        "tags": ["upgrade","cochange"] + (["config"] if is_config else []),
+        "keywords": [fw, group, artifact, v1, v2, Path(path).suffix]
+    }
+    body = header + "\nDiff:\n" + (snippet if snippet else "(diff omitted)")
+    return Chunk(
+        external_id=path or chash,
+        language="text",
+        symbol_kind="cochange_example",
+        is_recipe=True, is_config=is_config, is_example=True,
+        content=body, metadata=meta
+    )
+
+def make_notes_chunk(fw: str, chash: str, author: str, date: str,
+                     path: str, snippet: str) -> Chunk:
+    header = (
+        f"[Release Notes]\nFramework: {fw}\nCommit: {chash}\nAuthor: {author}\nDate: {date}\nFile: {path}\n"
+    )
+    meta = {
+        "framework_folder": fw,
+        "group": "docs", "artifact": Path(path).name,
+        "commit": chash, "author": author, "date": date,
+        "source_path": path,
+        "tags": ["release_notes","upgrade"], "keywords": [fw, "breaking", "migration", "deprecated"]
+    }
+    return Chunk(
+        external_id=path or chash,
+        language="text",
+        symbol_kind="release_notes",
+        is_recipe=False, is_config=False, is_example=False,
+        content=header + "\nDiff:\n" + (snippet if snippet else "(diff omitted)"),
+        metadata=meta
+    )
+
+def make_ledger_chunk(fw: str, group: str, artifact: str,
+                      versions: List[str], latest: str, latest_date: Optional[str]) -> Chunk:
+    content = (
+        f"[Versions]\nFramework: {fw}\nArtifact: {group}:{artifact}\n"
+        f"Observed: {', '.join(versions)}\nLatest: {latest}" + (f" ({latest_date})" if latest_date else "")
+    )
+    meta = {
+        "framework_folder": fw,
+        "group": group, "artifact": artifact,
+        "versions": versions, "latest": latest, "latest_date": latest_date,
+        "tags": ["versions","upgrade"], "keywords": [fw, group, artifact, "latest","versions"]
+    }
+    return Chunk(
+        external_id=f"versions/{fw}/{group}:{artifact}",
+        language="text",
+        symbol_kind="version_ledger",
+        is_recipe=False, is_config=False, is_example=False,
+        content=content, metadata=meta
+    )
+
+# ----------------- build all chunks -----------------
+def build_chunks(commits: List[dict], base_prefix: str, max_cochange_per_commit:int=5) -> List[Chunk]:
+    edges: List[Chunk] = []
+    plugin_up: List[Chunk] = []
+    props: List[Chunk] = []
+    tools: List[Chunk] = []
+    locks: List[Chunk] = []
+    notes: List[Chunk] = []
+    cochg: List[Chunk] = []
+
+    # temp: remember bumps per commit for co-change association
+    bumps_by_commit: Dict[str, List[Tuple[str,str,str,str]]] = {}  # commit -> list of (fw, ga, from, to)
+
+    for c in commits:
+        chash, author, date = c.get("hash",""), c.get("author",""), c.get("date","")
+        produced_co = 0
+
+        for d in c["diffs"]:
+            bpath = d["b"]; name = Path(bpath).name
+            fw = first_segment_after(bpath, base_prefix)
+            lines = d["lines"]
+
+            # --- primary upgrade sources ---
+            bump_list: List[Tuple[str,str,str]] = []
+            kind = "upgrade"
+
+            if name in ("build.gradle","build.gradle.kts"):
+                bump_list += detect_gradle_bumps(lines)
+                # plugins too
+                for pid, v1, v2 in detect_gradle_plugin_bumps(lines):
+                    plugin_up.append(make_plugin_chunk(fw, chash, author, date, bpath, pid, v1, v2))
+                # gradle.properties handled when name==gradle.properties below
+
+            elif name == "pom.xml":
+                bump_list += detect_pom_bumps(lines)
+                # maven property, parent, import BOM
+                for prop, v1, v2 in detect_maven_property_bumps(lines):
+                    props.append(make_property_chunk(fw, chash, author, date, bpath, prop, v1, v2, maven=True))
+                for ga, v1, v2 in detect_maven_parent_bump(lines):
+                    edges.append(make_edge_chunk(fw, chash, author, date, bpath, ga, v1, v2, kind="parent_upgrade"))
+                for ga, v1, v2 in detect_maven_bom_import_bumps(lines):
+                    edges.append(make_edge_chunk(fw, chash, author, date, bpath, ga, v1, v2, kind="bom_upgrade"))
+
+            elif TOML_FILE_RE.match(bpath):
+                for ga, v1, v2 in detect_toml_catalog_bumps(lines):
+                    bump_list.append((ga, v1, v2))
+
+            elif name == "gradle.properties":
+                for prop, v1, v2 in detect_gradle_properties_bumps(lines):
+                    props.append(make_property_chunk(fw, chash, author, date, bpath, prop, v1, v2, maven=False))
+
+            elif name in ("settings.gradle","settings.gradle.kts"):
+                for pid, v1, v2 in detect_gradle_plugin_bumps(lines):
+                    plugin_up.append(make_plugin_chunk(fw, chash, author, date, bpath, pid, v1, v2))
+
+            elif name in ("gradle-wrapper.properties","maven-wrapper.properties"):
+                for tool, v1, v2, file_tag in detect_wrapper_bumps(lines):
+                    tools.append(make_tool_chunk(fw, chash, author, date, bpath, tool, v1, v2))
+
+            elif LOCKFILE_RE.match(bpath):
+                for ga, v1, v2 in detect_lockfile_bumps(lines):
+                    # treat as lock_update (useful hint, lower priority)
+                    edges.append(make_edge_chunk(fw, chash, author, date, bpath, ga, v1, v2, kind="lock_update"))
+
+            # build-file dependency bumps → edges
+            for (ga, v1, v2) in bump_list:
+                edges.append(make_edge_chunk(fw, chash, author, date, bpath, ga, v1, v2, kind="upgrade"))
+                bumps_by_commit.setdefault(chash, []).append((fw, ga, v1, v2))
+
+            # release/migration notes snippets
+            if NOTES_FILES_RE.search(name):
+                sn = extract_notes_snippet(lines)
+                if sn:
+                    notes.append(make_notes_chunk(fw, chash, author, date, bpath, sn))
+
+        # ---- co-change across files in this commit ----
+        if chash in bumps_by_commit:
+            bumps = bumps_by_commit[chash]
+            for d in c["diffs"]:
+                bpath = d["b"]; name = Path(bpath).name
+                if name in BUILD_FILES:   # already captured by edges
+                    continue
+                if not (CODE_FILES_RE.match(bpath) or CONF_FILES_RE.match(bpath)):
+                    continue
+                fw = first_segment_after(bpath, base_prefix)
+                lines = d["lines"]
+                for (fw0, ga, v1, v2) in bumps:
+                    if fw0 != fw:
+                        # keep co-changes inside same framework folder
+                        continue
+                    snippet = extract_cochange_snippet(lines, ga.split(":",1)[1])
+                    if not snippet:
+                        continue
+                    cochg.append(make_cochange_chunk(fw, chash, author, date, bpath, ga, v1, v2, snippet, bool(CONF_FILES_RE.match(bpath))))
+                    produced_co += 1
+                    if produced_co >= max_cochange_per_commit:
+                        break
+                if produced_co >= max_cochange_per_commit:
+                    break
+
+    # ---- version ledgers from edges (and BOM/parent/lock_update too) ----
+    ledgers = build_ledgers_from_edges(edges)
+
+    # Merge all chunks
+    all_chunks: List[Chunk] = []
+    all_chunks.extend(edges)
+    all_chunks.extend(plugin_up)
+    all_chunks.extend(props)
+    all_chunks.extend(tools)
+    all_chunks.extend(locks)  # (kept for symmetry; 'edges' already contains lock_update edges)
+    all_chunks.extend(notes)
+    all_chunks.extend(cochg)
+    all_chunks.extend(ledgers)
+
+    # Deduplicate by (symbol_kind, external_id, first line of content, commit if present)
+    seen = set()
+    uniq: List[Chunk] = []
+    for ch in all_chunks:
+        meta = ch.metadata or {}
+        key = (ch.symbol_kind, ch.external_id, (ch.content.splitlines()[0] if ch.content else ""), meta.get("commit",""))
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(ch)
+
+    return uniq
+
+def build_ledgers_from_edges(edge_chunks: List[Chunk]) -> List[Chunk]:
+    # Collect per (framework, group, artifact)
+    buckets: Dict[Tuple[str,str,str], Dict[str, Optional[str]]] = {}
+    for ch in edge_chunks:
+        md = ch.metadata or {}
+        fw = md.get("framework_folder","")
+        g  = md.get("group","")
+        a  = md.get("artifact","")
+        if not (fw and g and a): 
+            continue
+        # include both from and to
+        fv = md.get("from_version"); tv = md.get("to_version")
+        d  = md.get("date")
+        key = (fw,g,a)
+        if key not in buckets:
+            buckets[key] = {}
+        if fv: buckets[key].setdefault(fv, None)
+        if tv: buckets[key][tv] = buckets[key].get(tv) or d
+
+    ledgers: List[Chunk] = []
+    for (fw,g,a), vers in buckets.items():
+        ordered = sorted(vers.keys(), key=semver_key)
+        if not ordered:
+            continue
+        latest = ordered[-1]
+        latest_date = vers.get(latest)
+        ledgers.append(make_ledger_chunk(fw, g, a, ordered, latest, latest_date))
+    return ledgers
+
+# ----------------- CLI -----------------
 def main():
-    ap = argparse.ArgumentParser(description="Convert edges + ledgers JSONL into kb_ingest.py row format")
-    ap.add_argument("--edges", required=True, help="upgrade_edges.jsonl from gitlog parser")
-    ap.add_argument("--ledgers", required=True, help="versions_ledger.jsonl from gitlog parser")
-    ap.add_argument("--out", required=True, help="output JSONL for kb_ingest.py --input-jsonl")
+    ap = argparse.ArgumentParser(description="Parse git log -p and emit ONE merged JSONL with edges/ledgers/cochanges/plugins/properties/tools/notes.")
+    ap.add_argument("--log-file", required=True, help="Path to file produced by `git log -p` (use --date=iso-strict --no-color).")
+    ap.add_argument("--base-prefix", default="frameworks/", help="Prefix to infer framework folder (e.g., 'frameworks/').")
+    ap.add_argument("--out", default="merged_chunks.jsonl", help="Output JSONL path (single file with all chunks).")
+    ap.add_argument("--max-cochange-per-commit", type=int, default=5, help="Cap co-change chunks per commit.")
     args = ap.parse_args()
 
-    edges = iter_jsonl(args.edges)
-    ledgers = iter_jsonl(args.ledgers)
+    commits = parse_gitlog(Path(args.log_file))
+    chunks = build_chunks(commits, args.base_prefix, max_cochange_per_commit=args.max_cochange_per_commit)
+    with open(args.out, "w", encoding="utf-8") as f:
+        for ch in chunks:
+            obj = asdict(ch)
+            # embeddings: keep null so your ingest can fill them (or backfill later)
+            obj["embedding"] = None
+            f.write(json.dumps(obj, ensure_ascii=False) + "\n")
 
-    rows = [edge_to_row(e) for e in edges] + [ledger_to_row(L) for L in ledgers]
-
-    Path(args.out).write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in rows) + "\n", encoding="utf-8")
-    print(f"[ok] wrote {len(rows)} rows to {args.out}")
+    print(f"[ok] commits: {len(commits)} | chunks written: {len(chunks)} → {args.out}")
 
 if __name__ == "__main__":
     main()
