@@ -1,5 +1,122 @@
 package com.manideepr.chat;
 
+import com.intellij.openapi.project.Project;
+import com.intellij.openapi.wm.ToolWindow;
+import com.intellij.openapi.wm.ToolWindowFactory;
+import com.intellij.ui.SimpleToolWindowPanel;
+import com.intellij.ui.content.Content;
+import com.intellij.ui.content.ContentFactory;
+import com.intellij.util.Disposer;
+import org.jetbrains.annotations.NotNull;
+
+import javax.swing.*;
+import java.awt.*;
+import java.util.UUID;
+
+public class ChatToolWindowFactory implements ToolWindowFactory {
+
+  private static final int LARGE_THRESHOLD = 8_000;
+
+  @Override
+  public void createToolWindowContent(@NotNull Project project, @NotNull ToolWindow toolWindow) {
+    SimpleToolWindowPanel root = new SimpleToolWindowPanel(true, true);
+
+    // Center: JCEF markdown view
+    JcefMarkdownChatView view = new JcefMarkdownChatView();
+
+    // Context store (selected files)
+    ChatContextStore ctx = ChatContextStore.getInstance(project);
+
+    // ---- Bottom input row ----
+    // Handler passed to constructor: ONLY mutates the store. No references to `input` here.
+    ChatInputPanel input = new ChatInputPanel(
+        project,
+        text -> { if (!text.isBlank()) ChatService.getInstance(project).ask(null, text); },
+        new ChatInputPanel.AddContextHandler() {
+          @Override public void addFiles(java.util.List<com.intellij.openapi.vfs.VirtualFile> files) {
+            ctx.addFiles(files); // chips will refresh via ctx.onChange
+          }
+          @Override public void removeFile(com.intellij.openapi.vfs.VirtualFile vf) {
+            ctx.removeFile(vf);  // chips will refresh via ctx.onChange
+          }
+        }
+    );
+
+    // Refresh runnable that *can* safely reference `input` (after it's constructed)
+    Runnable refreshChips = () ->
+        input.setAttachedFiles(
+            ctx.getFiles(),
+            new ChatInputPanel.AddContextHandler() {
+              @Override public void addFiles(java.util.List<com.intellij.openapi.vfs.VirtualFile> files) { ctx.addFiles(files); }
+              @Override public void removeFile(com.intellij.openapi.vfs.VirtualFile vf) { ctx.removeFile(vf); }
+            }
+        );
+
+    // Initial chips + subscribe to context changes
+    refreshChips.run();
+    ctx.onChange(() -> SwingUtilities.invokeLater(refreshChips));
+
+    // Layout
+    JPanel content = new JPanel(new BorderLayout());
+    content.add(view.getComponent(), BorderLayout.CENTER);
+    content.add(input, BorderLayout.SOUTH);
+    root.setContent(content);
+
+    // ---- Hook ChatService -> JCEF view ----
+    ChatService chat = ChatService.getInstance(project);
+    final String[] pendingIdRef = new String[1];
+
+    chat.setSink(new ChatService.Sink() {
+      @Override public void onReset() {
+        pendingIdRef[0] = null;
+        view.clear();
+      }
+      @Override public void onUser(String text) {
+        view.addUser(text);
+        String id = UUID.randomUUID().toString().replace("-", "");
+        pendingIdRef[0] = id;
+        view.addPendingAssistant(id);
+      }
+      @Override public void onAssistant(String text) {
+        String id = pendingIdRef[0]; pendingIdRef[0] = null;
+        if (id != null) {
+          if (text != null && text.length() > LARGE_THRESHOLD) {
+            view.resolvePendingLarge(id, text);
+          } else {
+            view.resolvePending(id, text == null ? "" : text);
+          }
+        } else {
+          if (text != null && text.length() > LARGE_THRESHOLD) {
+            String tmp = UUID.randomUUID().toString().replace("-", "");
+            view.addPendingAssistant(tmp);
+            view.resolvePendingLarge(tmp, text);
+          } else {
+            view.addAssistant(text == null ? "" : text);
+          }
+        }
+      }
+      @Override public void onError(String message) {
+        String id = pendingIdRef[0]; pendingIdRef[0] = null;
+        String md = "```text\n" + (message == null ? "" : message) + "\n```";
+        if (id != null) view.resolvePending(id, md); else view.addAssistant(md);
+      }
+    });
+
+    Content tab = ContentFactory.getInstance().createContent(root, "Chat", false);
+    Disposer.register(tab, () -> {
+      ChatService.getInstance(project).setSink(null);
+      ctx.clear();
+    });
+    toolWindow.getContentManager().addContent(tab);
+  }
+}
+
+
+
+======
+
+package com.manideepr.chat;
+
 import com.intellij.openapi.application.ReadAction;
 import com.intellij.openapi.components.Service;
 import com.intellij.openapi.project.Project;
