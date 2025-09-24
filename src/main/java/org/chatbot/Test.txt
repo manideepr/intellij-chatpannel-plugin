@@ -1,102 +1,361 @@
-{
-  // ===== Required traceability for THIS record (one commit/file scope) =====
-  "commit_id": "abc1234",                 // Git commit SHA (short or full) where these facts were observed
-  "file": "src/main/java/.../Foo.java",   // File path within repo where the change occurred
+package com.manideepr.chat;
 
-  // ===== API surface deltas detected in this file/commit =====
-  "apis_added": [                         // New public/protected APIs made available by this change
-    {
-      "symbol": "FooService.register",    // Fully-qualified-ish name (Class.member or package.Class)
-      "signature": "public User register(RegistrationRequest req)" // Full declaration (visibility, return, name, params, throws)
-    }
-  ],
-  "apis_removed": [                       // Public/protected APIs that no longer exist after this change
-    {
-      "symbol": "FooService.createUser",
-      "signature": "public User createUser(String username, String password)"
-    }
-  ],
-  "api_changes": [                        // Modifications to existing API (not pure add/remove)
-    {
-      "symbol": "FooService.getUserById", // API identifier that changed
-      "from": "public User getUserById(long id)",     // Previous signature/declaration
-      "to":   "public Optional<User> getUserById(long id)" // New signature/declaration
-    }
-  ],
+import com.intellij.openapi.application.ReadAction;
+import com.intellij.openapi.components.Service;
+import com.intellij.openapi.project.Project;
+import com.intellij.openapi.vfs.VfsUtilCore;
+import com.intellij.openapi.vfs.VirtualFile;
+import org.jetbrains.annotations.NotNull;
 
-  // ===== Deprecations (still present but discouraged) =====
-  "deprecations": [
-    {
-      "symbol": "FooService.updatePassword", // API that was marked @Deprecated or in docs
-      "since": "3.1.0",                      // Version/commit when deprecation introduced (best effort)
-      "replacement": "FooService.resetPassword" // Suggested alternative if stated/known
-    }
-  ],
+import java.nio.charset.StandardCharsets;
+import java.util.*;
+import java.util.concurrent.CopyOnWriteArrayList;
 
-  // ===== Configuration key/value/default changes =====
-  "config_changes": [
-    {
-      "key": "server.ssl.enabled",           // Config property name (Spring/Micronaut/Quarkus/etc.)
-      "from": "false (default)",             // Old value/key/default (stringify for readability)
-      "to": "true (default)"                 // New value/key/default
-    }
-  ],
+@Service(Service.Level.PROJECT)
+public final class ChatContextStore {
+  public static final int MAX_BYTES_PER_FILE = 80_000;   // ~80 KB/file
+  public static final int MAX_FILES = 8;                 // cap number of files
 
-  // ===== Build/dependency/plugin changes =====
-  "build_changes": [
-    {
-      "tool": "maven",                       // Build system: "maven" | "gradle" | "bazel" | etc.
-      "group": "org.springframework.boot",   // Dependency group
-      "artifact": "spring-boot-starter-web", // Dependency artifact/module
-      "from": "2.7.4",                       // Previous version (if known)
-      "to": "3.0.0"                          // New version
-    }
-  ],
+  private final Project project;
+  private final List<VirtualFile> files = new CopyOnWriteArrayList<>();
+  private final List<Runnable> listeners = new CopyOnWriteArrayList<>();
 
-  // ===== OPTIONAL: Targeted code snippets for key changes (small, curated) =====
-  "code_changes": [
-    {
-      "symbol": "FooService.getUserById",    // The API/member this snippet illustrates
-      "before": "public User getUserById(long id) { ... }",           // Minimal before-code (trim noisy bodies)
-      "after":  "public Optional<User> getUserById(long id) { ... }", // Minimal after-code
-      "language": "java",                    // Language of snippet (e.g., java, yaml, xml, gradle)
-      "context": "Return type changed to Optional; call sites must handle empty.", // Short human note (optional)
-      "evidence": {                          // Where this snippet came from in the diff
-        "commit_id": "abc1234",
-        "file": "src/main/java/.../FooService.java",
-        "lines": "L80-L95"                   // Line range anchors within the diff/hunk
-      }
-    },
-    {
-      "symbol": "application.yml:server.ssl.enabled", // For config/build, you can use a synthetic “symbol”
-      "before": "server:\n  ssl:\n    enabled: false",
-      "after":  "server:\n  ssl:\n    enabled: true",
-      "language": "yaml",
-      "context": "Default flipped to true; ensure certs exist in all envs.",
-      "evidence": {
-        "commit_id": "def5678",
-        "file": "src/main/resources/application.yml",
-        "lines": "L10-L15"
+  public ChatContextStore(Project project) { this.project = project; }
+
+  public static ChatContextStore getInstance(Project p) { return p.getService(ChatContextStore.class); }
+
+  public List<VirtualFile> getFiles() { return Collections.unmodifiableList(files); }
+
+  public void addFiles(Collection<VirtualFile> toAdd) {
+    boolean changed = false;
+    for (VirtualFile vf : toAdd) {
+      if (vf == null) continue;
+      if (files.size() >= MAX_FILES) break;
+      if (!files.contains(vf) && vf.isValid() && !vf.isDirectory()) {
+        files.add(vf);
+        changed = true;
       }
     }
-  ],
+    if (changed) notifyListeners();
+  }
 
-  // ===== Free-form migration guidance + hard links to evidence =====
-  "migration_notes": [
-    {
-      "note": "Method createUser was removed; migrate to register(RegistrationRequest).",
-      "evidence": {
-        "commit_id": "abc1234",
-        "file": "src/main/java/.../FooService.java",
-        "lines": "L45-L70"
+  public void removeFile(VirtualFile vf) {
+    if (files.remove(vf)) notifyListeners();
+  }
+
+  public void clear() {
+    if (!files.isEmpty()) { files.clear(); notifyListeners(); }
+  }
+
+  public void onChange(Runnable r) { listeners.add(r); }
+  public void removeListener(Runnable r) { listeners.remove(r); }
+  private void notifyListeners() { for (Runnable r : listeners) r.run(); }
+
+  /** Read selected files (truncated) and return a JSON-like section for the prompt. */
+  public String buildContextBlock() {
+    return ReadAction.compute(() -> {
+      StringBuilder sb = new StringBuilder(4096);
+      sb.append("## Attached files\n");
+      for (VirtualFile vf : files) {
+        if (!vf.isValid() || vf.isDirectory()) continue;
+        byte[] bytes;
+        try {
+          bytes = VfsUtilCore.loadBytes(vf);
+        } catch (Exception e) {
+          continue;
+        }
+        boolean truncated = bytes.length > MAX_BYTES_PER_FILE;
+        int len = Math.min(bytes.length, MAX_BYTES_PER_FILE);
+        String text = new String(bytes, 0, len, StandardCharsets.UTF_8);
+        sb.append("\n### ").append(vf.getPath()).append("\n");
+        sb.append("```").append(extOrText(vf)).append("\n")
+          .append(text)
+          .append(truncated ? "\n…(truncated)…" : "")
+          .append("\n```\n");
       }
-    }
-  ],
+      return sb.toString();
+    });
+  }
 
-  // ===== Risk classification tags for quick triage =====
-  "risk_flags": [
-    "semver-major",                 // Breaking change by SemVer rules
-    "public-api-removed",           // Public API deletion detected
-    "serialization-change"          // DTO/field/type changes impacting wire/persistence
-  ]
+  private static String extOrText(@NotNull VirtualFile vf) {
+    String ext = vf.getExtension();
+    return ext == null || ext.isBlank() ? "text" : ext.toLowerCase(Locale.ROOT);
+  }
 }
+
+package com.manideepr.chat;
+
+import com.intellij.openapi.fileChooser.FileChooser;
+import com.intellij.openapi.fileChooser.FileChooserDescriptor;
+import com.intellij.openapi.project.Project;
+import com.intellij.openapi.vfs.VirtualFile;
+import com.intellij.ui.components.JBPanel;
+import com.intellij.util.ui.JBUI;
+
+import javax.swing.*;
+import java.awt.*;
+import java.util.List;
+import java.util.function.Consumer;
+
+public class ChatInputPanel extends JBPanel<ChatInputPanel> {
+  private final JTextArea area = new JTextArea(3, 20);
+  private final JPanel chips = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 6));
+
+  public interface AddContextHandler { void addFiles(List<VirtualFile> files); void removeFile(VirtualFile vf); }
+
+  public ChatInputPanel(Project project, Consumer<String> onSend, AddContextHandler addCtx) {
+    super(new BorderLayout(6, 6));
+    setBorder(JBUI.Borders.empty(6, 10));
+
+    // chips row
+    chips.setBorder(JBUI.Borders.empty(2, 0));
+    chips.setOpaque(false);
+
+    // text area
+    area.setLineWrap(true);
+    area.setWrapStyleWord(true);
+    JScrollPane scroll = new JScrollPane(area);
+
+    // buttons
+    JPanel buttons = new JPanel(new FlowLayout(FlowLayout.RIGHT, 6, 6));
+    JButton add = new JButton("Add context");
+    JButton send = new JButton("Send");
+
+    add.addActionListener(e -> {
+      FileChooserDescriptor desc = new FileChooserDescriptor(true, false, false, false, false, true);
+      desc.setTitle("Attach files as chat context");
+      FileChooser.chooseFiles(desc, project, null, selected -> addCtx.addFiles(selected));
+    });
+
+    send.addActionListener(e -> {
+      String text = area.getText().trim();
+      if (!text.isEmpty()) { onSend.accept(text); area.setText(""); }
+    });
+
+    // Enter to send
+    area.getInputMap().put(KeyStroke.getKeyStroke("ENTER"), "send");
+    area.getActionMap().put("send", new AbstractAction() {
+      @Override public void actionPerformed(java.awt.event.ActionEvent e) { send.doClick(); }
+    });
+
+    buttons.add(add);
+    buttons.add(send);
+
+    add(chips, BorderLayout.NORTH);
+    add(scroll, BorderLayout.CENTER);
+    add(buttons, BorderLayout.SOUTH);
+  }
+
+  /** Re-render the file chips with tiny “x” remove buttons. */
+  public void setAttachedFiles(List<VirtualFile> files, AddContextHandler addCtx) {
+    chips.removeAll();
+    for (VirtualFile vf : files) {
+      JPanel pill = new JPanel(new FlowLayout(FlowLayout.CENTER, 4, 0));
+      pill.setBorder(JBUI.Borders.compound(
+          JBUI.Borders.customLine(JBUI.CurrentTheme.Popup.borderColor(true), 1),
+          JBUI.Borders.empty(2, 6)));
+      JLabel name = new JLabel(shortPath(vf));
+      JButton x = new JButton("×");
+      x.setMargin(new Insets(0,4,0,4));
+      x.setFocusable(false);
+      x.addActionListener(e -> addCtx.removeFile(vf));
+      pill.add(name); pill.add(x);
+      chips.add(pill);
+    }
+    chips.revalidate(); chips.repaint();
+  }
+
+  private static String shortPath(VirtualFile vf) {
+    String p = vf.getPath();
+    if (p.length() > 60) return "…" + p.substring(Math.max(0, p.length()-57));
+    return p;
+  }
+}
+
+package com.manideepr.chat;
+
+import com.intellij.openapi.project.Project;
+import com.intellij.openapi.wm.ToolWindow;
+import com.intellij.openapi.wm.ToolWindowFactory;
+import com.intellij.ui.SimpleToolWindowPanel;
+import com.intellij.ui.content.Content;
+import com.intellij.ui.content.ContentFactory;
+import com.intellij.util.Disposer;
+import org.jetbrains.annotations.NotNull;
+
+import javax.swing.*;
+import java.awt.*;
+
+public class ChatToolWindowFactory implements ToolWindowFactory {
+
+  @Override
+  public void createToolWindowContent(@NotNull Project project, @NotNull ToolWindow toolWindow) {
+    SimpleToolWindowPanel root = new SimpleToolWindowPanel(true, true);
+
+    // Center JCEF markdown chat view (your existing one with spinner/large support)
+    JcefMarkdownChatView view = new JcefMarkdownChatView();
+
+    ChatContextStore ctx = ChatContextStore.getInstance(project);
+
+    // Bottom input row now gets project + handlers
+    ChatInputPanel input = new ChatInputPanel(project, text -> {
+      if (!text.isBlank()) {
+        ChatService.getInstance(project).ask(null, text);
+      }
+    }, new ChatInputPanel.AddContextHandler() {
+      @Override public void addFiles(java.util.List<com.intellij.openapi.vfs.VirtualFile> files) {
+        ctx.addFiles(files);
+        input.setAttachedFiles(ctx.getFiles(), this);
+      }
+      @Override public void removeFile(com.intellij.openapi.vfs.VirtualFile vf) {
+        ctx.removeFile(vf);
+        input.setAttachedFiles(ctx.getFiles(), this);
+      }
+    });
+
+    // Initial chip state + react to external changes (e.g., clear)
+    input.setAttachedFiles(ctx.getFiles(), new ChatInputPanel.AddContextHandler() {
+      @Override public void addFiles(java.util.List<com.intellij.openapi.vfs.VirtualFile> files) { /* not used here */ }
+      @Override public void removeFile(com.intellij.openapi.vfs.VirtualFile vf) { /* not used here */ }
+    });
+    ctx.onChange(() -> SwingUtilities.invokeLater(() ->
+        input.setAttachedFiles(ctx.getFiles(), new ChatInputPanel.AddContextHandler() {
+          @Override public void addFiles(java.util.List<com.intellij.openapi.vfs.VirtualFile> files) { ctx.addFiles(files); }
+          @Override public void removeFile(com.intellij.openapi.vfs.VirtualFile vf) { ctx.removeFile(vf); }
+        })));
+
+    JPanel content = new JPanel(new BorderLayout());
+    content.add(view.getComponent(), BorderLayout.CENTER);
+    content.add(input, BorderLayout.SOUTH);
+    root.setContent(content);
+
+    // Hook ChatService -> JCEF view (same as you already have)
+    ChatService chat = ChatService.getInstance(project);
+    final String[] pendingIdRef = new String[1];
+    chat.setSink(new ChatService.Sink() {
+      @Override public void onReset() { pendingIdRef[0] = null; view.clear(); }
+      @Override public void onUser(String text) {
+        view.addUser(text);
+        String id = java.util.UUID.randomUUID().toString().replace("-", "");
+        pendingIdRef[0] = id;
+        view.addPendingAssistant(id);
+      }
+      @Override public void onAssistant(String text) {
+        String id = pendingIdRef[0]; pendingIdRef[0] = null;
+        if (id != null) {
+          if (text != null && text.length() > 8000) view.resolvePendingLarge(id, text);
+          else view.resolvePending(id, text == null ? "" : text);
+        } else {
+          if (text != null && text.length() > 8000) {
+            String tmp = java.util.UUID.randomUUID().toString().replace("-", "");
+            view.addPendingAssistant(tmp); view.resolvePendingLarge(tmp, text);
+          } else view.addAssistant(text == null ? "" : text);
+        }
+      }
+      @Override public void onError(String message) {
+        String id = pendingIdRef[0]; pendingIdRef[0] = null;
+        String md = "```text\n" + (message == null ? "" : message) + "\n```";
+        if (id != null) view.resolvePending(id, md); else view.addAssistant(md);
+      }
+    });
+
+    Content tab = ContentFactory.getInstance().createContent(root, "Chat", false);
+    Disposer.register(tab, () -> {
+      ChatService.getInstance(project).setSink(null);
+      ctx.clear();
+    });
+    toolWindow.getContentManager().addContent(tab);
+  }
+}
+
+
+package com.manideepr.chat;
+
+import com.intellij.openapi.application.ApplicationManager;
+import com.intellij.openapi.components.Service;
+import com.intellij.openapi.project.Project;
+import org.chatbot.ChatBotAPI;
+import org.jetbrains.annotations.Nullable;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+
+@Service(Service.Level.PROJECT)
+public final class ChatService {
+  private final Project project;
+  public ChatService(Project project) { this.project = project; }
+
+  public interface Sink {
+    void onUser(String text);
+    void onAssistant(String text);
+    void onError(String message);
+    default void onReset() {}
+  }
+
+  private enum Role { USER, ASSISTANT, ERROR }
+  private static final class Msg {
+    final Role role; final String text;
+    Msg(Role role, String text) { this.role = role; this.text = text; }
+  }
+
+  private final List<Msg> transcript = Collections.synchronizedList(new ArrayList<>());
+  private volatile @Nullable Sink sink;
+
+  public static ChatService getInstance(Project project) { return project.getService(ChatService.class); }
+
+  public void setSink(@Nullable Sink sink) {
+    this.sink = sink;
+    if (sink == null) return;
+    sink.onReset();
+    List<Msg> snap;
+    synchronized (transcript) { snap = new ArrayList<>(transcript); }
+    for (Msg m : snap) switch (m.role) {
+      case USER -> sink.onUser(m.text);
+      case ASSISTANT -> sink.onAssistant(m.text);
+      case ERROR -> sink.onError(m.text);
+    }
+  }
+
+  public void ask(@Nullable String selection, String question) {
+    recordAndNotify(Role.USER, question);
+
+    ApplicationManager.getApplication().executeOnPooledThread(() -> {
+      try {
+        // Build context ONLY from explicitly attached files
+        String ctxBlock = ChatContextStore.getInstance(project).buildContextBlock();
+
+        StringBuilder prompt = new StringBuilder(4096);
+        prompt.append("You are an IDE assistant. Use the attached files as primary context.\n\n");
+        prompt.append("## Question\n").append(question).append("\n\n");
+        if (selection != null && !selection.isBlank()) {
+          prompt.append("## Editor selection\n").append(selection).append("\n\n");
+        }
+        if (!ctxBlock.isBlank()) prompt.append(ctxBlock);
+
+        String answer = ChatBotAPI.ask(prompt.toString());
+
+        ApplicationManager.getApplication().invokeLater(() ->
+            recordAndNotify(Role.ASSISTANT, answer));
+      } catch (Exception ex) {
+        ApplicationManager.getApplication().invokeLater(() ->
+            recordAndNotify(Role.ERROR, "Request failed: " + ex.getMessage()));
+      }
+    });
+  }
+
+  private void recordAndNotify(Role role, String text) {
+    transcript.add(new Msg(role, text));
+    Sink s = sink; if (s == null) return;
+    switch (role) {
+      case USER -> s.onUser(text);
+      case ASSISTANT -> s.onAssistant(text);
+      case ERROR -> s.onError(text);
+    }
+  }
+}
+
+
+
+
+
