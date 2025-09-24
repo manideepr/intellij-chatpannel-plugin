@@ -1,12 +1,102 @@
 {
-  "commit_id": "...",
-  "file": "...",
-  "apis_added": [{"symbol": "...", "signature": "..."}],
-  "apis_removed": [{"symbol": "...", "signature": "..."}],
-  "api_changes": [{"symbol":"...", "from":"...", "to":"..."}],
-  "deprecations": [{"symbol":"...", "since":"...", "replacement":"..."}],
-  "config_changes": [{"key":"...", "from":"...", "to":"..."}],
-  "build_changes": [{"tool":"maven|gradle", "group":"...", "artifact":"...", "from":"...", "to":"..."}],
-  "migration_notes": [{"note":"...", "evidence":{"commit_id":"...","file":"...","lines":"L120-150"}}],
-  "risk_flags": ["semver-major","public-api-removed","serialization-change"]
+  // ===== Required traceability for THIS record (one commit/file scope) =====
+  "commit_id": "abc1234",                 // Git commit SHA (short or full) where these facts were observed
+  "file": "src/main/java/.../Foo.java",   // File path within repo where the change occurred
+
+  // ===== API surface deltas detected in this file/commit =====
+  "apis_added": [                         // New public/protected APIs made available by this change
+    {
+      "symbol": "FooService.register",    // Fully-qualified-ish name (Class.member or package.Class)
+      "signature": "public User register(RegistrationRequest req)" // Full declaration (visibility, return, name, params, throws)
+    }
+  ],
+  "apis_removed": [                       // Public/protected APIs that no longer exist after this change
+    {
+      "symbol": "FooService.createUser",
+      "signature": "public User createUser(String username, String password)"
+    }
+  ],
+  "api_changes": [                        // Modifications to existing API (not pure add/remove)
+    {
+      "symbol": "FooService.getUserById", // API identifier that changed
+      "from": "public User getUserById(long id)",     // Previous signature/declaration
+      "to":   "public Optional<User> getUserById(long id)" // New signature/declaration
+    }
+  ],
+
+  // ===== Deprecations (still present but discouraged) =====
+  "deprecations": [
+    {
+      "symbol": "FooService.updatePassword", // API that was marked @Deprecated or in docs
+      "since": "3.1.0",                      // Version/commit when deprecation introduced (best effort)
+      "replacement": "FooService.resetPassword" // Suggested alternative if stated/known
+    }
+  ],
+
+  // ===== Configuration key/value/default changes =====
+  "config_changes": [
+    {
+      "key": "server.ssl.enabled",           // Config property name (Spring/Micronaut/Quarkus/etc.)
+      "from": "false (default)",             // Old value/key/default (stringify for readability)
+      "to": "true (default)"                 // New value/key/default
+    }
+  ],
+
+  // ===== Build/dependency/plugin changes =====
+  "build_changes": [
+    {
+      "tool": "maven",                       // Build system: "maven" | "gradle" | "bazel" | etc.
+      "group": "org.springframework.boot",   // Dependency group
+      "artifact": "spring-boot-starter-web", // Dependency artifact/module
+      "from": "2.7.4",                       // Previous version (if known)
+      "to": "3.0.0"                          // New version
+    }
+  ],
+
+  // ===== OPTIONAL: Targeted code snippets for key changes (small, curated) =====
+  "code_changes": [
+    {
+      "symbol": "FooService.getUserById",    // The API/member this snippet illustrates
+      "before": "public User getUserById(long id) { ... }",           // Minimal before-code (trim noisy bodies)
+      "after":  "public Optional<User> getUserById(long id) { ... }", // Minimal after-code
+      "language": "java",                    // Language of snippet (e.g., java, yaml, xml, gradle)
+      "context": "Return type changed to Optional; call sites must handle empty.", // Short human note (optional)
+      "evidence": {                          // Where this snippet came from in the diff
+        "commit_id": "abc1234",
+        "file": "src/main/java/.../FooService.java",
+        "lines": "L80-L95"                   // Line range anchors within the diff/hunk
+      }
+    },
+    {
+      "symbol": "application.yml:server.ssl.enabled", // For config/build, you can use a synthetic “symbol”
+      "before": "server:\n  ssl:\n    enabled: false",
+      "after":  "server:\n  ssl:\n    enabled: true",
+      "language": "yaml",
+      "context": "Default flipped to true; ensure certs exist in all envs.",
+      "evidence": {
+        "commit_id": "def5678",
+        "file": "src/main/resources/application.yml",
+        "lines": "L10-L15"
+      }
+    }
+  ],
+
+  // ===== Free-form migration guidance + hard links to evidence =====
+  "migration_notes": [
+    {
+      "note": "Method createUser was removed; migrate to register(RegistrationRequest).",
+      "evidence": {
+        "commit_id": "abc1234",
+        "file": "src/main/java/.../FooService.java",
+        "lines": "L45-L70"
+      }
+    }
+  ],
+
+  // ===== Risk classification tags for quick triage =====
+  "risk_flags": [
+    "semver-major",                 // Breaking change by SemVer rules
+    "public-api-removed",           // Public API deletion detected
+    "serialization-change"          // DTO/field/type changes impacting wire/persistence
+  ]
 }
