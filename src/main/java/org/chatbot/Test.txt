@@ -1,3 +1,221 @@
+
+package com.manideepr.chat;
+
+import com.intellij.openapi.application.ReadAction;
+import com.intellij.openapi.editor.Editor;
+import com.intellij.openapi.fileEditor.FileEditorManager;
+import com.intellij.openapi.project.DumbService;
+import com.intellij.openapi.project.Project;
+import com.intellij.openapi.vfs.VirtualFile;
+import com.intellij.psi.*;
+import com.intellij.psi.util.PsiTreeUtil;
+import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
+
+import java.nio.charset.StandardCharsets;
+import java.util.*;
+import java.util.function.Predicate;
+
+/** Builds a compact, budgeted context block for .java files using PSI. */
+final class JavaContextExtractor {
+  private JavaContextExtractor() {}
+
+  static String buildJavaContext(Project project, VirtualFile vf, int byteBudget) {
+    if (DumbService.isDumb(project)) {
+      // Indexing: fall back to raw truncation
+      return fenced("java", rawTruncate(vf, byteBudget));
+    }
+    return ReadAction.compute(() -> {
+      PsiFile psiFile = PsiManager.getInstance(project).findFile(vf);
+      if (!(psiFile instanceof PsiJavaFile javaFile)) {
+        return fenced("java", rawTruncate(vf, byteBudget));
+      }
+
+      StringBuilder out = new StringBuilder(Math.min(byteBudget, 8192));
+      // Header: package + imports
+      if (javaFile.getPackageName() != null && !javaFile.getPackageName().isBlank()) {
+        out.append("package ").append(javaFile.getPackageName()).append(";\n\n");
+      }
+      for (PsiImportStatement imp : javaFile.getImportList() != null ? javaFile.getImportList().getImportStatements() : new PsiImportStatement[0]) {
+        out.append(imp.getText()).append("\n");
+      }
+      if (out.length() > 0) out.append("\n");
+
+      // Choose top-level type
+      PsiClass[] classes = javaFile.getClasses();
+      if (classes.length == 0) {
+        return fenced("java", headTail(rawText(vf), byteBudget));
+      }
+      PsiClass top = classes[0];
+
+      // Class signature
+      out.append(signature(top)).append(" {\n");
+
+      // Collect members
+      List<PsiMember> members = new ArrayList<>();
+      Collections.addAll(members, top.getFields());
+      Collections.addAll(members, top.getMethods());
+      Collections.addAll(members, top.getInnerClasses());
+
+      // Prioritize relevant methods (names contain common verbs or caret method)
+      Set<PsiMethod> preferred = new LinkedHashSet<>();
+      Editor ed = FileEditorManager.getInstance(project).getSelectedTextEditor();
+      PsiMethod caretMethod = ed != null ? PsiTreeUtil.getParentOfType(javaFile.findElementAt(ed.getCaretModel().getOffset()), PsiMethod.class) : null;
+      if (caretMethod != null) preferred.add(caretMethod);
+
+      Predicate<String> isHot = n -> {
+        String s = n.toLowerCase(Locale.ROOT);
+        return s.contains("init") || s.contains("start") || s.contains("render") || s.contains("build")
+            || s.contains("handle") || s.contains("process") || s.contains("service") || s.contains("run")
+            || s.contains("execute") || s.contains("update");
+      };
+      for (PsiMethod m : top.getMethods()) if (isHot.test(m.getName())) preferred.add(m);
+
+      // Budgeted write helper
+      BudgetWriter bw = new BudgetWriter(out, byteBudget);
+
+      // 1) Always write field & method signatures (cheap)
+      for (PsiField f : top.getFields()) {
+        if (!bw.writeLine("  " + signature(f) + ";\n")) return fenced("java", bw.finishWithBrace());
+      }
+      for (PsiMethod m : top.getMethods()) {
+        if (!bw.writeLine("  " + signature(m) + " { /* … */ }\n")) return fenced("java", bw.finishWithBrace());
+      }
+
+      // 2) Write bodies for preferred methods first
+      for (PsiMethod m : preferred) {
+        String body = bodyText(m);
+        if (body != null && !body.isBlank()) {
+          if (!bw.write("  " + signature(m) + " {\n" + indent(body, 4) + "\n  }\n")) {
+            return fenced("java", bw.finishWithBrace());
+          }
+        }
+      }
+
+      // 3) Fill remaining budget with other method bodies (short ones first)
+      List<PsiMethod> others = new ArrayList<>(Arrays.asList(top.getMethods()));
+      others.removeAll(preferred);
+      others.sort(Comparator.comparingInt(m -> (bodyText(m) == null ? Integer.MAX_VALUE : bodyText(m).length())));
+      for (PsiMethod m : others) {
+        String body = bodyText(m);
+        if (body == null || body.isBlank()) continue;
+        if (!bw.write("  " + signature(m) + " {\n" + indent(body, 4) + "\n  }\n")) break;
+      }
+
+      // Close class
+      bw.write("}\n");
+      return fenced("java", bw.toString());
+    });
+  }
+
+  // ---------- helpers ----------
+
+  private static String signature(PsiClass c) {
+    StringBuilder s = new StringBuilder();
+    s.append(Objects.toString(c.getModifierList() != null ? c.getModifierList().getText() : "", "").trim());
+    if (s.length() > 0) s.append(" ");
+    s.append(c.isInterface() ? "interface " : c.isEnum() ? "enum " : "class ").append(c.getName());
+    PsiReferenceList ext = c.getExtendsList();
+    PsiReferenceList impl = c.getImplementsList();
+    if (ext != null && ext.getReferenceElements().length > 0) {
+      s.append(" extends ").append(ext.getText().replace("extends", "").trim());
+    }
+    if (impl != null && impl.getReferenceElements().length > 0) {
+      s.append(" implements ").append(impl.getText().replace("implements", "").trim());
+    }
+    return s.toString().replaceAll("\\s+", " ").trim();
+  }
+
+  private static String signature(PsiMethod m) {
+    String mods = Objects.toString(m.getModifierList().getText(), "").trim();
+    String ret = Objects.toString(m.getReturnType() != null ? m.getReturnType().getPresentableText() : "void", "void");
+    StringBuilder ps = new StringBuilder();
+    ps.append("(");
+    PsiParameter[] params = m.getParameterList().getParameters();
+    for (int i = 0; i < params.length; i++) {
+      if (i > 0) ps.append(", ");
+      ps.append(params[i].getType().getPresentableText()).append(" ").append(params[i].getName());
+    }
+    ps.append(")");
+    String name = m.getName();
+    String head = ((mods.isEmpty() ? "" : mods + " ") + ret + " " + name + ps).replaceAll("\\s+", " ").trim();
+    return head;
+  }
+
+  private static String signature(PsiField f) {
+    String mods = Objects.toString(f.getModifierList() != null ? f.getModifierList().getText() : "", "").trim();
+    String type = Objects.toString(f.getType() != null ? f.getType().getPresentableText() : "var", "var");
+    String head = ((mods.isEmpty() ? "" : mods + " ") + type + " " + f.getName()).replaceAll("\\s+", " ").trim();
+    return head;
+  }
+
+  private static String bodyText(PsiMethod m) {
+    PsiCodeBlock b = m.getBody();
+    return b == null ? null : b.getText().replaceAll("^\\{\\s*|\\s*}$", "");
+  }
+
+  private static String indent(String s, int n) {
+    String pad = " ".repeat(n);
+    return s.replaceAll("(?m)^", pad);
+  }
+
+  private static String rawText(VirtualFile vf) {
+    try {
+      byte[] bytes = vf.contentsToByteArray();
+      return new String(bytes, StandardCharsets.UTF_8);
+    } catch (Exception e) {
+      return "";
+    }
+  }
+
+  private static String headTail(String s, int budget) {
+    if (s == null) return "";
+    byte[] bytes = s.getBytes(StandardCharsets.UTF_8);
+    if (bytes.length <= budget) return s;
+    int half = Math.max(0, (budget - 64) / 2); // leave for marker & fences
+    String head = new String(bytes, 0, Math.min(bytes.length, half), StandardCharsets.UTF_8);
+    String tail = new String(bytes, Math.max(0, bytes.length - half), Math.min(half, bytes.length), StandardCharsets.UTF_8);
+    return head + "\n/* …omitted… */\n" + tail;
+  }
+
+  private static String rawTruncate(VirtualFile vf, int budget) {
+    return headTail(rawText(vf), budget);
+  }
+
+  private static String fenced(String lang, String body) {
+    return "```" + lang + "\n" + (body == null ? "" : body) + "\n```\n";
+  }
+
+  /** Writes only while total UTF-8 bytes <= budget. */
+  private static final class BudgetWriter {
+    private final StringBuilder sb;
+    private final int budget;
+    BudgetWriter(StringBuilder sb, int budget) { this.sb = sb; this.budget = budget; }
+    boolean write(String s) {
+      byte[] add = s.getBytes(StandardCharsets.UTF_8);
+      if (sb.toString().getBytes(StandardCharsets.UTF_8).length + add.length > budget) return false;
+      sb.append(s); return true;
+    }
+    boolean writeLine(String s) { return write(s); }
+    String finishWithBrace() {
+      if (!sb.toString().endsWith("}\n")) sb.append("}\n");
+      return sb.toString();
+    }
+    @Override public String toString() { return sb.toString(); }
+  }
+}
+
+
+
+
+
+
+
+
+
+===================
+
+
 package com.manideepr.chat;
 
 import com.intellij.openapi.project.Project;
